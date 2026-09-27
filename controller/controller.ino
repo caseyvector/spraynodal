@@ -1,212 +1,253 @@
 #include <WiFi.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
+#include <WiFiClientSecure.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
 #include <Preferences.h>
 #include "secrets.h"
 
-const int MOSS_RELAY_PIN = 25;
-const int LICHEN_RELAY_PIN = 26;
-
-// If pumps run when they should be off (and stop when they should spray),
-// your relay module is active-LOW: swap HIGH and LOW on these two lines.
-const int RELAY_ON  = HIGH;
+// ================= Hardware =================
+const int RELAY_ON  = HIGH;   // swap HIGH/LOW if your relay module is active-LOW
 const int RELAY_OFF = LOW;
+const unsigned long MAX_MIST_MS = 8000;   // hard safety ceiling
 
-const unsigned long MAX_MIST_DURATION = 8000; // hard safety ceiling (ms)
+// ================= Zones =================
+// Pin numbers live here on purpose: the cloud never chooses pins.
+struct Zone {
+  const char* name;
+  int pin;
+  unsigned long intervalMin;
+  unsigned long burstSec;
+  bool enabled;
+  unsigned long lastStart;
+  bool manualPending;
+};
 
-// --- Settings: these are defaults; saved values load from flash at boot ---
-unsigned long mossIntervalMin   = 240;   // every 4 hours
-unsigned long lichenIntervalMin = 1440;  // every 24 hours
-unsigned long mossBurstSec      = 5;
-unsigned long lichenBurstSec    = 2;
+Zone zones[] = {
+  { "moss",   25, 240,  5, true, 0, false },
+  { "lichen", 26, 1440, 2, true, 0, false },
+};
+const int NUM_ZONES = sizeof(zones) / sizeof(zones[0]);
 
-unsigned long mossLastStart = 0;
-unsigned long lichenLastStart = 0;
-unsigned long activeMistStart = 0;
+int activeZone = -1;            // -1 means nothing is spraying
+unsigned long activeStart = 0;
+bool activeManual = false;
 
-enum ActivePump { NONE, MOSS, LICHEN };
-ActivePump activePump = NONE;
+// ================= Cloud =================
+const unsigned long SYNC_EVERY_MS = 60UL * 1000;   // check in every 60 s
+unsigned long lastSync = 0;
+bool firstSync = true;
 
-WebServer server(80);
+// Sprays waiting to be logged (sent only while no pump is running)
+struct LogEntry { int zone; int durationSec; bool manual; };
+const int LOG_QUEUE_SIZE = 10;
+LogEntry logQueue[LOG_QUEUE_SIZE];
+int logCount = 0;
+
 Preferences prefs;
 
-// ---------- Helpers ----------
+// ================= Helpers =================
+unsigned long minToMs(unsigned long m) { return m * 60UL * 1000UL; }
 
-unsigned long minutesToMs(unsigned long m) {
-  return m * 60UL * 1000UL;
+int findZone(const char* name) {
+  for (int i = 0; i < NUM_ZONES; i++) {
+    if (strcmp(zones[i].name, name) == 0) return i;
+  }
+  return -1;
 }
 
-unsigned long minutesUntil(unsigned long lastStart, unsigned long intervalMin, unsigned long now) {
-  unsigned long elapsed = now - lastStart;
-  unsigned long interval = minutesToMs(intervalMin);
-  if (elapsed >= interval) return 0;
-  return (interval - elapsed) / 60000UL;
-}
-
-// ---------- Saving settings to flash ----------
-
+// ================= Saved settings (flash) =================
 void loadSettings() {
   prefs.begin("spraynodal", false);
-  mossIntervalMin   = prefs.getULong("mossInt", mossIntervalMin);
-  lichenIntervalMin = prefs.getULong("lichenInt", lichenIntervalMin);
-  mossBurstSec      = prefs.getULong("mossBurst", mossBurstSec);
-  lichenBurstSec    = prefs.getULong("lichenBurst", lichenBurstSec);
+  for (int i = 0; i < NUM_ZONES; i++) {
+    String n = zones[i].name;
+    zones[i].intervalMin = constrain(prefs.getULong((n + "_int").c_str(), zones[i].intervalMin), 1UL, 10080UL);
+    zones[i].burstSec    = constrain(prefs.getULong((n + "_burst").c_str(), zones[i].burstSec), 1UL, 8UL);
+    zones[i].enabled     = prefs.getBool((n + "_en").c_str(), zones[i].enabled);
+  }
   prefs.end();
 }
 
-void saveSettings() {
+void saveZone(int i) {
+  String n = zones[i].name;
   prefs.begin("spraynodal", false);
-  prefs.putULong("mossInt", mossIntervalMin);
-  prefs.putULong("lichenInt", lichenIntervalMin);
-  prefs.putULong("mossBurst", mossBurstSec);
-  prefs.putULong("lichenBurst", lichenBurstSec);
+  prefs.putULong((n + "_int").c_str(), zones[i].intervalMin);
+  prefs.putULong((n + "_burst").c_str(), zones[i].burstSec);
+  prefs.putBool((n + "_en").c_str(), zones[i].enabled);
   prefs.end();
 }
 
-// ---------- Pumps ----------
+// ================= Pumps =================
+void allRelaysOff() {
+  for (int i = 0; i < NUM_ZONES; i++) digitalWrite(zones[i].pin, RELAY_OFF);
+}
 
-void startPump(ActivePump which) {
-  activePump = which;
-  activeMistStart = millis();
-  if (which == MOSS) {
-    digitalWrite(MOSS_RELAY_PIN, RELAY_ON);
-    Serial.println("MOSS pump ON");
-  } else {
-    digitalWrite(LICHEN_RELAY_PIN, RELAY_ON);
-    Serial.println("LICHEN pump ON");
+void startZone(int i, bool manual) {
+  activeZone = i;
+  activeStart = millis();
+  activeManual = manual;
+  zones[i].lastStart = activeStart;   // a manual spray also restarts the schedule
+  digitalWrite(zones[i].pin, RELAY_ON);
+  Serial.printf("%s pump ON (%s)\n", zones[i].name, manual ? "manual" : "schedule");
+}
+
+void stopActive() {
+  allRelaysOff();
+  Serial.printf("%s pump OFF\n", zones[activeZone].name);
+  if (logCount < LOG_QUEUE_SIZE) {
+    logQueue[logCount++] = { activeZone, (int)zones[activeZone].burstSec, activeManual };
   }
+  activeZone = -1;
 }
 
-void stopPump() {
-  digitalWrite(MOSS_RELAY_PIN, RELAY_OFF);
-  digitalWrite(LICHEN_RELAY_PIN, RELAY_OFF);
-  Serial.println(activePump == MOSS ? "MOSS pump OFF" : "LICHEN pump OFF");
-  activePump = NONE;
-}
+// ================= Supabase =================
+// Calls a database function; returns the HTTP status and fills in the response
+int callRpc(const char* fn, const String& body, String& response) {
+  WiFiClientSecure client;
+  client.setInsecure();   // TEMPORARY: replaced in the hardening phase
 
-// ---------- Web pages ----------
-
-void redirectHome() {
-  server.sendHeader("Location", "/");
-  server.send(303);
-}
-
-void handleRoot() {
-  unsigned long now = millis();
-  String status = (activePump == NONE) ? "Idle"
-                : (activePump == MOSS) ? "MOSS spraying" : "LICHEN spraying";
-
-  String page = "<html><head><meta name='viewport' content='width=device-width'></head>";
-  page += "<body style='font-family:sans-serif'>";
-  page += "<h1>Spraynodal</h1>";
-  page += "<p>Status: <b>" + status + "</b><br>";
-  page += "Next moss spray in: " + String(minutesUntil(mossLastStart, mossIntervalMin, now)) + " min<br>";
-  page += "Next lichen spray in: " + String(minutesUntil(lichenLastStart, lichenIntervalMin, now)) + " min</p>";
-
-  page += "<h2>Settings</h2><form action='/set'>";
-  page += "Moss interval (minutes): <input name='mossInt' value='" + String(mossIntervalMin) + "'><br><br>";
-  page += "Moss burst (seconds, 1-8): <input name='mossBurst' value='" + String(mossBurstSec) + "'><br><br>";
-  page += "Lichen interval (minutes): <input name='lichenInt' value='" + String(lichenIntervalMin) + "'><br><br>";
-  page += "Lichen burst (seconds, 1-8): <input name='lichenBurst' value='" + String(lichenBurstSec) + "'><br><br>";
-  page += "<input type='submit' value='Save'></form>";
-
-  page += "<h2>Test</h2><form action='/test'>";
-  page += "<button name='pump' value='moss'>Spray moss now</button> ";
-  page += "<button name='pump' value='lichen'>Spray lichen now</button></form>";
-
-  page += "</body></html>";
-  server.send(200, "text/html", page);
-}
-
-// Reads one form field; only accepts it if it's within [minVal, maxVal]
-void readSetting(const char* name, unsigned long &target, long minVal, long maxVal) {
-  if (server.hasArg(name)) {
-    long v = server.arg(name).toInt();
-    if (v >= minVal && v <= maxVal) target = v;
+  HTTPClient http;
+  http.setTimeout(5000);
+  http.begin(client, String(SUPABASE_URL) + "/rest/v1/rpc/" + fn);
+  http.addHeader("Content-Type", "application/json");
+  http.addHeader("apikey", SUPABASE_KEY);
+  if (String(SUPABASE_KEY).startsWith("eyJ")) {
+    http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
   }
+
+  int code = http.POST(body);
+  response = http.getString();
+  http.end();
+  return code;
 }
 
-void handleSet() {
-  readSetting("mossInt",     mossIntervalMin,   1, 10080); // 1 min to 1 week
-  readSetting("lichenInt",   lichenIntervalMin, 1, 10080);
-  readSetting("mossBurst",   mossBurstSec,      1, 8);     // never above safety ceiling
-  readSetting("lichenBurst", lichenBurstSec,    1, 8);
-  saveSettings();
-  Serial.printf("Saved: moss %lu min / %lu s, lichen %lu min / %lu s\n",
-                mossIntervalMin, mossBurstSec, lichenIntervalMin, lichenBurstSec);
-  redirectHome();
+String authFields() {
+  return String("\"p_node_id\":\"") + NODE_ID + "\",\"p_device_key\":\"" + DEVICE_KEY + "\"";
 }
 
-void handleTest() {
-  if (activePump == NONE && server.hasArg("pump")) {   // interlock: one pump at a time
-    if (server.arg("pump") == "moss") {
-      startPump(MOSS);
-      mossLastStart = millis();     // counts as a real spray, schedule restarts
-    } else if (server.arg("pump") == "lichen") {
-      startPump(LICHEN);
-      lichenLastStart = millis();
+void syncWithCloud() {
+  String response;
+  int code = callRpc("device_sync", String("{") + authFields() + "}", response);
+  if (code != 200) {
+    Serial.printf("Sync failed: HTTP %d %s\n", code, response.c_str());
+    return;   // keep running on the settings we already have
+  }
+
+  JsonDocument doc;
+  if (deserializeJson(doc, response)) {
+    Serial.println("Sync: couldn't read response");
+    return;
+  }
+
+  // Settings
+  for (JsonObject z : doc["zones"].as<JsonArray>()) {
+    int i = findZone(z["name"] | "");
+    if (i < 0) continue;   // a zone this node doesn't have
+    if (!z["interval_min"].is<int>() || !z["burst_sec"].is<int>()) continue;   // skip bad data
+
+    unsigned long iv = constrain(z["interval_min"].as<long>(), 1L, 10080L);
+    unsigned long bs = constrain(z["burst_sec"].as<long>(), 1L, 8L);
+    bool en = z["enabled"] | true;
+
+    if (iv != zones[i].intervalMin || bs != zones[i].burstSec || en != zones[i].enabled) {
+      zones[i].intervalMin = iv;
+      zones[i].burstSec = bs;
+      zones[i].enabled = en;
+      saveZone(i);   // only write flash when something actually changed
+      Serial.printf("Updated %s: every %lu min, %lu s, %s\n",
+                    zones[i].name, iv, bs, en ? "enabled" : "disabled");
     }
   }
-  redirectHome();
+
+  // "Spray now" commands
+  for (JsonObject c : doc["commands"].as<JsonArray>()) {
+    int i = findZone(c["zone"] | "");
+    if (i >= 0) {
+      zones[i].manualPending = true;
+      Serial.printf("Command received: spray %s\n", zones[i].name);
+    }
+  }
 }
 
-// ---------- Setup & loop ----------
+void flushLogs() {
+  while (logCount > 0) {
+    LogEntry e = logQueue[0];
+    String body = String("{") + authFields() +
+                  ",\"p_zone\":\"" + zones[e.zone].name + "\"" +
+                  ",\"p_duration_sec\":" + e.durationSec +
+                  ",\"p_source\":\"" + (e.manual ? "manual" : "schedule") + "\"}";
+    String response;
+    int code = callRpc("device_log_spray", body, response);
+    if (code < 200 || code >= 300) {
+      Serial.printf("Log failed: HTTP %d, will retry\n", code);
+      return;
+    }
+    for (int k = 1; k < logCount; k++) logQueue[k - 1] = logQueue[k];
+    logCount--;
+  }
+}
 
+// ================= Setup & loop =================
 void setup() {
   // Fail-safe: relays OFF before anything else
-  pinMode(MOSS_RELAY_PIN, OUTPUT);
-  pinMode(LICHEN_RELAY_PIN, OUTPUT);
-  digitalWrite(MOSS_RELAY_PIN, RELAY_OFF);
-  digitalWrite(LICHEN_RELAY_PIN, RELAY_OFF);
+  for (int i = 0; i < NUM_ZONES; i++) {
+    pinMode(zones[i].pin, OUTPUT);
+    digitalWrite(zones[i].pin, RELAY_OFF);
+  }
 
   Serial.begin(115200);
   delay(1000);
-  Serial.println("Spraynodal controller starting...");
+  Serial.println("Spraynodal node starting...");
 
   loadSettings();
 
   WiFi.mode(WIFI_STA);
   WiFi.begin(WIFI_SSID, WIFI_PASS);
-  unsigned long startTime = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - startTime < 15000) {
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(500);
     Serial.print(".");
   }
   Serial.println();
-
   if (WiFi.status() == WL_CONNECTED) {
-    Serial.print("Connected! IP address: ");
+    Serial.print("Wi-Fi connected, IP: ");
     Serial.println(WiFi.localIP());
-    MDNS.begin("spraynodal");
   } else {
-    Serial.println("Wi-Fi failed, running schedule without it");
+    Serial.println("Wi-Fi failed, running on saved settings");
   }
-
-  server.on("/", handleRoot);
-  server.on("/set", handleSet);
-  server.on("/test", handleTest);
-  server.begin();
 }
 
 void loop() {
-  server.handleClient();   // must run every loop, even while spraying
-
   unsigned long now = millis();
 
-  if (activePump != NONE) {
-    unsigned long burstMs = (activePump == MOSS ? mossBurstSec : lichenBurstSec) * 1000UL;
-    unsigned long cutoff = min(burstMs, MAX_MIST_DURATION);
-    if (now - activeMistStart >= cutoff) {
-      stopPump();
-    }
+  // 1. A pump is running: only decide when to stop it. No network calls while spraying.
+  if (activeZone >= 0) {
+    unsigned long burstMs = min(zones[activeZone].burstSec * 1000UL, MAX_MIST_MS);
+    if (now - activeStart >= burstMs) stopActive();
     return;
   }
 
-  if (now - mossLastStart >= minutesToMs(mossIntervalMin)) {
-    startPump(MOSS);
-    mossLastStart = now;
-  } else if (now - lichenLastStart >= minutesToMs(lichenIntervalMin)) {
-    startPump(LICHEN);
-    lichenLastStart = now;
+  // 2. Manual "spray now" commands go first
+  for (int i = 0; i < NUM_ZONES; i++) {
+    if (zones[i].manualPending) {
+      zones[i].manualPending = false;
+      startZone(i, true);
+      return;
+    }
+  }
+
+  // 3. Scheduled sprays
+  for (int i = 0; i < NUM_ZONES; i++) {
+    if (zones[i].enabled && now - zones[i].lastStart >= minToMs(zones[i].intervalMin)) {
+      startZone(i, false);
+      return;
+    }
+  }
+
+  // 4. Idle: talk to the cloud
+  if (WiFi.status() == WL_CONNECTED && (firstSync || now - lastSync >= SYNC_EVERY_MS)) {
+    firstSync = false;
+    lastSync = now;
+    syncWithCloud();
+    flushLogs();
   }
 }

@@ -98,3 +98,78 @@ $$;
 -- Only allow calling it, nothing else
 revoke all on function device_checkin(uuid, uuid) from public;
 grant execute on function device_checkin(uuid, uuid) to anon;
+
+-- Node check-in v2: returns settings AND claims any pending "spray now" commands
+create or replace function device_sync(p_node_id uuid, p_device_key uuid)
+returns json
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_zones json;
+  v_commands json;
+begin
+  update nodes set last_seen = now()
+   where id = p_node_id and device_key = p_device_key;
+  if not found then
+    raise exception 'invalid node credentials';
+  end if;
+
+  select coalesce(json_agg(json_build_object(
+           'name', z.name,
+           'interval_min', z.interval_min,
+           'burst_sec', z.burst_sec,
+           'enabled', z.enabled) order by z.name), '[]'::json)
+    into v_zones
+    from zones z
+   where z.node_id = p_node_id;
+
+  -- Mark all pending commands as done, but only hand back recent ones.
+  -- A "spray now" from 3 days ago (node was offline) should NOT fire.
+  with claimed as (
+    update commands c set done_at = now()
+      from zones z
+     where c.zone_id = z.id
+       and z.node_id = p_node_id
+       and c.done_at is null
+    returning c.id, c.created_at, z.name as zone_name
+  )
+  select coalesce(json_agg(json_build_object('id', id, 'zone', zone_name) order by id), '[]'::json)
+    into v_commands
+    from claimed
+   where created_at > now() - interval '10 minutes';
+
+  return json_build_object('zones', v_zones, 'commands', v_commands);
+end;
+$$;
+
+revoke all on function device_sync(uuid, uuid) from public;
+grant execute on function device_sync(uuid, uuid) to anon;
+
+-- Nodes call this after each spray to record it
+create or replace function device_log_spray(
+  p_node_id uuid, p_device_key uuid, p_zone text, p_duration_sec int, p_source text)
+returns void
+language plpgsql
+security definer
+set search_path = public
+as $$
+declare
+  v_zone_id uuid;
+begin
+  select z.id into v_zone_id
+    from zones z join nodes n on n.id = z.node_id
+   where n.id = p_node_id and n.device_key = p_device_key and z.name = p_zone;
+
+  if v_zone_id is null then
+    raise exception 'invalid node credentials or zone';
+  end if;
+
+  insert into spray_log (zone_id, duration_sec, source)
+  values (v_zone_id, p_duration_sec, p_source);
+end;
+$$;
+
+revoke all on function device_log_spray(uuid, uuid, text, int, text) from public;
+grant execute on function device_log_spray(uuid, uuid, text, int, text) to anon;
