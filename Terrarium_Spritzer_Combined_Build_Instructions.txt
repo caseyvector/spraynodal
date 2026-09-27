@@ -1,0 +1,217 @@
+TERRARIUM SPRITZER - COMBINED BUILD (V1+V2, TWO-JAR SYSTEM)
+=============================================================
+
+
+0. READ THIS FIRST: SAFETY RULES
+---------------------------------
+- MAINS ISOLATION: nothing in this build should ever touch 120V directly at
+  the jar. The wall adapter converts to 12V before anything gets near water.
+  Keep the AC side (wall plug -> adapter) physically separated from the wet
+  zone.
+- GFCI: plug the 12V wall adapter into a GFCI-protected outlet, since it's
+  operating near water sources.
+- FUSE EVERY PUMP BRANCH: you have 4 waterproof fuse holders - use one per
+  pump, inline on the 12V+ wire between the power supply and the relay.
+- DRIP LOOPS: any wire or tube that runs down into a wet area should have a
+  low point ("drip loop") before it reaches an electrical connection, so
+  water runs off the loop instead of wicking into the connector.
+- POLARITY CHECK every connection before powering on - reversed polarity on
+  the pump can damage it; reversed polarity on the ESP32/relay can damage
+  the board.
+- NEVER let a pump run dry for extended periods - your specific pump model
+  tolerates occasional dry running, but don't rely on that; keep the
+  reservoir topped off and check tubing for kinks before each session.
+- NO OVER-PRESSURE: your pump is rated 85 PSI max but your nozzles are
+  low-flow reptile misting nozzles - this is normal, the pump's pressure
+  switch will cycle it, don't restrict the nozzle further or block it.
+- FAIL-SAFE DEFAULT: firmware should default relays to OFF on boot/reset,
+  and no single sensor or logic fault should be able to hold a pump on
+  indefinitely - always have a hard maximum on-time per cycle in code,
+  independent of any sensor reading.
+
+
+1. COMPLETE BILL OF MATERIALS
+------------------------------
+
+ALREADY IN HAND (confirmed from your orders):
+
+  Part                                          Spec                  Qty  Used
+  --------------------------------------------- --------------------- ---- ----
+  ESP32 DevKitC-32, CP2102, USB-C, 38-pin narrow HiLetgo               3    1  (2 spare)
+  Relay module, opto-isolated, 3.3V/5V trigger   3-pack                3    2  (1 spare)
+  12V diaphragm pump, 1.2 GPM, 85 PSI,           self-priming,         2    2
+    self-priming, 3/8" barb, 2.5A draw           3/8" barb
+  Reptile mister nozzle, adjustable, 1/4"        VEXPLO, 2-pack        2    2
+  Household hose filter, 60 mesh, 3/8"/1/2" barb Timsec, 4-pack        4    2  (2 spare)
+  Waterproof inline fuse holder + ATC fuses      Anyongora, 4-pack     4    2  (2 spare)
+  12V 5A (60W) power supply, 5.5x2.1mm           Meiyue                1    1
+  18 AWG silicone wire, red + black              BNTECHGO, 25ft each   2    as needed
+  1/4" OD tubing + push-to-connect fittings      ESHIONG, 30ft+20pcs   1    as needed
+  Breadboard + jumper wires                      BOJACK                1    prototyping
+  USB-A to USB-C cable, data-capable             Anker, 2-pack         2    1
+  Waterproof IP67 junction box                   TICONN                1    1 (houses ESP32+relay)
+  Nylon spade connectors                         TICONN, 100pc         1    as needed
+  DC time-delay relay w/ LCD                     DROK                  1    not used (superseded
+                                                                             by ESP32) - keep as
+                                                                             manual backup/spare
+  40mm 12V fan, dual ball bearing                ANVISION, 2-pack      2    test load only, not
+                                                                             in final build
+  Hose barb reducer, 1/4" to 3/8", brass         Joywayus (or equiv)   2    2  (bridges 1/4"
+                                                                             reservoir tubing to
+                                                                             Timsec filter's 3/8"
+                                                                             barb port)
+
+YOU'RE PROVIDING:
+  - Empty distilled-water jug (reservoir)
+  - Two identical jars
+  - Moss/lichen specimens
+
+GENERIC TOOLS (not itemized in orders - you likely have these):
+  - Wire strippers/cutters
+  - Small Phillips/flathead screwdriver
+  - Drill with a bit sized to your tubing OD (for the jug cap ports)
+  - Hot glue gun or silicone sealant (sealing cap ports)
+  - Small hose clamps or zip ties (securing barb connections)
+  - Multimeter (continuity + voltage checks - don't skip this)
+  - Utility knife or tubing cutter
+
+
+2. BUILD ORDER
+---------------
+Work in this order - each stage is testable before you commit to the next,
+so problems get caught small.
+
+STAGE A - LOW-VOLTAGE CONTROL CIRCUIT (breadboard first)
+
+  1. Wire the ESP32 to the relay module on the breadboard: ESP32 3.3V ->
+     relay VCC, ESP32 GND -> relay GND, two ESP32 GPIO pins -> relay IN1
+     and IN2. AVOID GPIO 0, 2, 12, 15 (boot-strapping pins) - pick two
+     general-purpose pins instead (e.g., GPIO 25 and GPIO 26 are safe,
+     commonly-broken-out choices on this board).
+  2. Power the ESP32 via USB from your computer for this stage - don't
+     connect 12V yet.
+  3. Flash a basic test sketch that toggles each relay channel independently
+     (see section 4 for logic). Confirm both relay LEDs click on/off
+     correctly from serial commands or a short timed test before moving on.
+  4. TEST WITH THE FAN, NOT THE PUMP. Wire one fan (12V, 0.1A) to relay 1's
+     switched output, powered from the 12V supply. Confirm the relay
+     reliably switches it. This validates your control logic with zero
+     water-damage risk before pumps ever get connected.
+
+STAGE B - 12V PUMP CIRCUIT (per pump, x2)
+
+  For each pump:
+  1. Cut two lengths of 18AWG wire (red/black) sized to reach from the
+     junction box to the pump's location.
+  2. Wire path: 12V PSU (+) -> fuse holder -> relay COM -> relay NO ->
+     pump (+). Pump (-) returns directly to PSU (-)/common ground.
+  3. Crimp spade connectors where wires meet the pump's terminals (if it
+     uses spade tabs) - otherwise solder + heat-shrink or use the wire
+     nuts/clamps appropriate to its terminal style.
+  4. Double-check polarity with the multimeter before connecting to the
+     pump.
+  5. Build a drip loop into each wire run just before it reaches the pump -
+     the wire should dip down and back up before terminating, so any water
+     that runs along it drips off at the low point instead of reaching the
+     connection.
+  6. Bench-test each pump on its own relay channel, dry-run for a few
+     seconds only (per the pump's self-priming spec) to confirm it spins
+     and the pressure switch behaves, before plumbing is attached.
+
+STAGE C - PLUMBING
+
+  1. RESERVOIR CAP: drill two holes in the distilled-water jug's cap,
+     sized to snugly pass your 1/4" tubing. Thread one length of tubing
+     through each hole, leaving several inches of slack inside the jug.
+     Seal around each hole with hot glue or silicone once tubing position
+     is set - you want a stable dip depth, not a moving tube.
+  2. PER LINE: reservoir tubing (1/4") -> barb reducer (1/4" to 3/8") ->
+     Timsec filter (3/8" barb) -> pump inlet (3/8" barb, direct
+     connection, no adapter needed) -> pump outlet (3/8" barb) -> reducer
+     back down to 1/4" if your onward tubing is 1/4" -> tubing run to the
+     jar -> nozzle.
+  3. Secure every barb connection with a small hose clamp - push-fit alone
+     isn't reliable on a barb joint that will see repeated pressure
+     cycling from the pump's pressure switch.
+  4. Route each tubing run with a drip loop before it reaches any
+     electronics, same principle as the wiring.
+  5. Mount each nozzle at the jar per your zoning plan (section 3) - moss
+     jar nozzle aimed for even coverage, lichen jar nozzle aimed for
+     indirect/light coverage away from where the lichen sits.
+  6. Fill the reservoir, then run each pump briefly with the nozzle open
+     to bleed air from the lines and confirm actual mist output before
+     final placement.
+
+STAGE D - ENCLOSURE AND FINAL WIRING
+
+  1. Mount the ESP32 and both relay channels inside the IP67 junction box.
+  2. Bring the 12V supply, both fused pump-branch wires, and the two pump
+     cable runs in through cable glands or a grommeted pass-through in the
+     box wall - not through an open gap.
+  3. Route the USB cable out to wherever you're powering the ESP32 (USB
+     wall adapter or a computer during development - if this runs
+     unattended long-term, you'll want a small USB wall charger, not just
+     a laptop).
+  4. Close up the box, do a final visual check for pinched wires or
+     tubing, and power on.
+
+
+3. JAR LAYOUT
+--------------
+MOSS JAR: nozzle positioned for even mist coverage of the jar interior.
+Place your Sphagnum (the reddish-maroon moss) lowest and closest to the
+nozzle - it's the wettest-preferring specimen you have. Standard
+cushion/mat moss sits in the general mist cone.
+
+LICHEN JAR: nozzle aimed for indirect, light coverage - not a direct spray
+target. Elevate lichen specimens (especially the pale, thread-like
+Usnea-type one) on rock or bark, positioned outside the direct mist cone,
+relying on ambient humidity rather than direct wetting. This jar's mist
+cycle should run far less often and briefly than the moss jar's.
+
+
+4. FIRMWARE LOGIC
+------------------
+Core rules to build into the sketch, not just nice-to-haves:
+
+  - Relay 1 = moss jar pump, Relay 2 = lichen jar pump.
+  - HARD INTERLOCK: never allow both relays to be HIGH at the same time.
+    This is your fix for the shared 5A power supply only having headroom
+    for one 2.5A pump at a time with any real margin. Enforce this in code
+    (e.g., a single activePump state variable) rather than just hoping the
+    schedules don't overlap.
+  - DEFAULT OFF ON BOOT: both relay pins should be explicitly set LOW/OFF
+    as the very first thing in setup(), before anything else runs.
+  - HARD MAX ON-TIME PER CYCLE: cap each mist burst (e.g., a few seconds)
+    in code regardless of what triggers it, so a logic bug can't hold a
+    pump on indefinitely.
+  - TWO INDEPENDENT SCHEDULES: moss jar cycles frequently (short interval,
+    e.g., every few hours), lichen jar cycles rarely (long interval, e.g.,
+    once a day or less) - exact numbers are a starting point to tune by
+    observation, not something to treat as fixed; watch how quickly each
+    jar dries out over the first week and adjust.
+  - Start with plain timed cycles (no sensors) - this matches where your
+    project already is. Humidity sensors per jar are a clean phase-2
+    addition later: add a sensor reading, and instead of "mist because
+    timer fired," mist because "timer fired AND humidity is below target,"
+    using the same relay/interlock logic you already built.
+
+
+5. COMMISSIONING CHECKLIST (do this before leaving it unattended)
+-------------------------------------------------------------------
+  [ ] Both relays default OFF on power-up/reset (test by cycling power)
+  [ ] Interlock verified - try to trigger both pumps at once in test code,
+      confirm only one ever actually runs
+  [ ] Multimeter continuity check on every crimped/soldered joint
+  [ ] All barb connections clamped, not just push-fit
+  [ ] Drip loops in place on every wire and tube entering the electronics
+      enclosure
+  [ ] Both fuses installed and correct amperage for a 2.5A pump (check the
+      fuse pack's included ratings - size above steady draw but well below
+      your wire gauge's rating)
+  [ ] Reservoir cap ports sealed, tubing depth set so both lines stay
+      submerged as water level drops
+  [ ] Dry-run test complete (fan load) before any pump was ever powered
+  [ ] Wet test complete - mist actually reaches both jars as intended, no
+      leaks at any joint
+  [ ] GFCI-protected outlet confirmed for the wall adapter
