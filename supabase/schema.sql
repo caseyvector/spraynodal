@@ -70,3 +70,31 @@ create policy "own commands" on commands for all
 create policy "read own spray log" on spray_log for select
   using (exists (select 1 from zones z join nodes n on n.id = z.node_id
                  where z.id = spray_log.zone_id and n.owner_id = auth.uid()));
+
+                 -- Nodes call this to check in and get their zone settings
+create or replace function device_checkin(p_node_id uuid, p_device_key uuid)
+returns table (zone_name text, interval_min int, burst_sec int, enabled boolean)
+language plpgsql
+security definer          -- runs with owner rights, so RLS doesn't block the node
+set search_path = public
+as $$
+begin
+  -- Verify the key and record the check-in in one step
+  update nodes set last_seen = now()
+   where id = p_node_id and device_key = p_device_key;
+
+  if not found then
+    raise exception 'invalid node credentials';
+  end if;
+
+  return query
+    select z.name, z.interval_min, z.burst_sec, z.enabled
+      from zones z
+     where z.node_id = p_node_id
+     order by z.name;
+end;
+$$;
+
+-- Only allow calling it, nothing else
+revoke all on function device_checkin(uuid, uuid) from public;
+grant execute on function device_checkin(uuid, uuid) to anon;
