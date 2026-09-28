@@ -1,0 +1,241 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spraynodal</title>
+<style>
+  :root { --bg:#f4f7f2; --card:#fff; --text:#1f2a1f; --muted:#6b776b; --accent:#2f7d4f; --line:#dde5dc; --warn:#b54708; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#121712; --card:#1b221b; --text:#e6ede6; --muted:#9aa89a; --accent:#5fbf85; --line:#2a342a; --warn:#f59e0b; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+  h1 { font-size:1.4rem; margin:0; }
+  h2 { font-size:1.1rem; margin:0 0 4px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin-top:8px; }
+  label { display:flex; flex-direction:column; font-size:.85rem; gap:4px; color:var(--muted); }
+  input { font:inherit; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); width:110px; }
+  #login input { width:100%; }
+  input[type=checkbox] { width:auto; height:22px; }
+  button { font:inherit; padding:8px 14px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }
+  .online { background:#22c55e; }
+  .offline { background:#9ca3af; }
+  .zone { border-top:1px solid var(--line); padding-top:12px; margin-top:12px; }
+  .msg { font-size:.9rem; margin-top:8px; min-height:1.2em; }
+  .error { color:var(--warn); }
+  table { width:100%; border-collapse:collapse; font-size:.9rem; }
+  td, th { text-align:left; padding:6px 4px; border-bottom:1px solid var(--line); }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>🌿 Spraynodal</h1>
+    <button id="logout" class="secondary" hidden>Log out</button>
+  </header>
+
+  <section id="login" class="card" hidden>
+    <h2>Sign in</h2>
+    <form id="login-form">
+      <label>Email <input type="email" id="email" autocomplete="username" required></label><br>
+      <label>Password <input type="password" id="password" autocomplete="current-password" required></label><br>
+      <button type="submit">Sign in</button>
+      <div id="login-msg" class="msg error"></div>
+    </form>
+  </section>
+
+  <section id="dashboard" hidden>
+    <div id="nodes"></div>
+    <div class="card">
+      <h2>Recent sprays</h2>
+      <table>
+        <thead><tr><th>When</th><th>Zone</th><th>Length</th><th>Type</th></tr></thead>
+        <tbody id="log"></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+// These two are public by design. Row-level security protects your data, not these.
+// NEVER put the "secret" / "service_role" key here.
+const SUPABASE_URL = 'https://lfuhyqoqpaypnfhfewwq.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_w4zY4EA2-bgKUYej-fHyPQ_OcEejpiK';
+
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+const $ = (id) => document.getElementById(id);
+
+// Small helper to build page elements safely
+function el(tag, props = {}, ...children) {
+  const e = document.createElement(tag);
+  Object.assign(e, props);
+  for (const c of children) e.append(c);
+  return e;
+}
+
+function ago(ts) {
+  if (!ts) return 'never';
+  const s = Math.round((Date.now() - new Date(ts)) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} d ago`;
+}
+
+function fmtInterval(m) {
+  if (m % 1440 === 0) return `${m / 1440} day${m === 1440 ? '' : 's'}`;
+  if (m % 60 === 0) return `${m / 60} h`;
+  return `${m} min`;
+}
+
+// ---------- Sign in / out ----------
+async function showScreen() {
+  const { data: { session } } = await sb.auth.getSession();
+  $('login').hidden = !!session;
+  $('dashboard').hidden = !session;
+  $('logout').hidden = !session;
+  if (session) loadDashboard();
+}
+
+$('login-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  $('login-msg').textContent = '';
+  const { error } = await sb.auth.signInWithPassword({
+    email: $('email').value,
+    password: $('password').value,
+  });
+  if (error) $('login-msg').textContent = error.message;
+  else showScreen();
+});
+
+$('logout').addEventListener('click', async () => {
+  await sb.auth.signOut();
+  showScreen();
+});
+
+// ---------- Dashboard ----------
+async function loadDashboard() {
+  const { data: nodes, error } = await sb
+    .from('nodes')
+    .select('id, name, last_seen, zones(id, name, interval_min, burst_sec, enabled)')
+    .order('name');
+
+  const box = $('nodes');
+  box.replaceChildren();
+  if (error) {
+    box.append(el('div', { className: 'card error', textContent: error.message }));
+    return;
+  }
+  if (!nodes.length) {
+    box.append(el('div', { className: 'card muted', textContent: 'No nodes yet.' }));
+  }
+
+  for (const node of nodes) {
+    // A node that checked in within 3 minutes counts as online
+    const online = node.last_seen && (Date.now() - new Date(node.last_seen)) < 3 * 60 * 1000;
+    const card = el('div', { className: 'card' },
+      el('h2', {}, el('span', { className: 'dot ' + (online ? 'online' : 'offline') }), node.name),
+      el('div', { className: 'muted', textContent: `${online ? 'Online' : 'Offline'} · last check-in ${ago(node.last_seen)}` })
+    );
+    node.zones.sort((a, b) => a.name.localeCompare(b.name));
+    for (const z of node.zones) card.append(zoneBlock(z));
+    box.append(card);
+  }
+  loadLog();
+}
+
+function zoneBlock(z) {
+  const interval = el('input', { type: 'number', min: 1, max: 10080, value: z.interval_min });
+  const burst = el('input', { type: 'number', min: 1, max: 8, value: z.burst_sec });
+  const enabled = el('input', { type: 'checkbox', checked: z.enabled });
+  const msg = el('div', { className: 'msg muted' });
+
+  const save = el('button', { textContent: 'Save' });
+  save.onclick = async () => {
+    save.disabled = true;
+    msg.className = 'msg muted';
+    msg.textContent = 'Saving…';
+    const { error } = await sb.from('zones').update({
+      interval_min: Number(interval.value),
+      burst_sec: Number(burst.value),
+      enabled: enabled.checked,
+    }).eq('id', z.id);
+    save.disabled = false;
+    if (error) {
+      msg.className = 'msg error';
+      msg.textContent = error.message;   // e.g. the database refusing a 20 s burst
+    } else {
+      msg.textContent = 'Saved. The node picks it up within a minute.';
+    }
+  };
+
+  const spray = el('button', { className: 'secondary', textContent: 'Spray now' });
+  spray.onclick = async () => {
+    spray.disabled = true;
+    const { error } = await sb.from('commands').insert({ zone_id: z.id, command: 'spray' });
+    msg.className = error ? 'msg error' : 'msg muted';
+    msg.textContent = error ? error.message : 'Queued. It sprays at the next check-in (within a minute).';
+    setTimeout(() => { spray.disabled = false; }, 5000);   // avoid accidental double-taps
+  };
+
+  return el('div', { className: 'zone' },
+    el('strong', { textContent: z.name }),
+    el('div', { className: 'muted', textContent: `Every ${fmtInterval(z.interval_min)}, ${z.burst_sec} s burst${z.enabled ? '' : ' · disabled'}` }),
+    el('div', { className: 'row' },
+      el('label', {}, 'Interval (min)', interval),
+      el('label', {}, 'Burst (s, 1–8)', burst),
+      el('label', {}, 'Enabled', enabled),
+      save,
+      spray
+    ),
+    msg
+  );
+}
+
+async function loadLog() {
+  const { data, error } = await sb
+    .from('spray_log')
+    .select('started_at, duration_sec, source, zones(name)')
+    .order('started_at', { ascending: false })
+    .limit(10);
+
+  const tbody = $('log');
+  tbody.replaceChildren();
+  if (error) {
+    tbody.append(el('tr', {}, el('td', { colSpan: 4, className: 'error', textContent: error.message })));
+    return;
+  }
+  if (!data.length) {
+    tbody.append(el('tr', {}, el('td', { colSpan: 4, className: 'muted', textContent: 'No sprays logged yet.' })));
+  }
+  for (const r of data) {
+    tbody.append(el('tr', {},
+      el('td', { textContent: new Date(r.started_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }) }),
+      el('td', { textContent: r.zones?.name ?? '?' }),
+      el('td', { textContent: `${r.duration_sec} s` }),
+      el('td', { textContent: r.source })
+    ));
+  }
+}
+
+// ---------- Start ----------
+showScreen();
+
+// Refresh every minute, but not while you're typing in a box
+setInterval(() => {
+  if (!$('dashboard').hidden && document.activeElement?.tagName !== 'INPUT') loadDashboard();
+}, 60000);
+</script>
+</body>
+</html>
