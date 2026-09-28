@@ -3,12 +3,17 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <Preferences.h>
+#include <esp_task_wdt.h>
 #include "secrets.h"
 
 // ================= Hardware =================
 const int RELAY_ON  = HIGH;   // swap HIGH/LOW if your relay module is active-LOW
 const int RELAY_OFF = LOW;
 const unsigned long MAX_MIST_MS = 8000;   // hard safety ceiling
+
+// Watchdog: if the ESP32 freezes for this long, it restarts itself,
+// and setup() switches every relay OFF. Safety net for a stuck pump.
+const uint32_t WATCHDOG_MS = 30000;
 
 // ================= Zones =================
 // Pin numbers live here on purpose: the cloud never chooses pins.
@@ -53,6 +58,31 @@ int findZone(const char* name) {
     if (strcmp(zones[i].name, name) == 0) return i;
   }
   return -1;
+}
+
+bool anySprayWaiting() {
+  for (int i = 0; i < NUM_ZONES; i++) {
+    if (zones[i].manualPending) return true;
+  }
+  return false;
+}
+
+// ================= Watchdog =================
+void startWatchdog() {
+  esp_task_wdt_config_t cfg = {
+    .timeout_ms = WATCHDOG_MS,
+    .idle_core_mask = 0,
+    .trigger_panic = true,     // restart the chip if it trips
+  };
+  // The watchdog usually exists already; if not, create it
+  if (esp_task_wdt_reconfigure(&cfg) != ESP_OK) {
+    esp_task_wdt_init(&cfg);
+  }
+  esp_task_wdt_add(NULL);      // watch this loop
+}
+
+void feedWatchdog() {
+  esp_task_wdt_reset();        // "I'm still alive"
 }
 
 // ================= Saved settings (flash) =================
@@ -102,11 +132,15 @@ void stopActive() {
 // ================= Supabase =================
 // Calls a database function; returns the HTTP status and fills in the response
 int callRpc(const char* fn, const String& body, String& response) {
+  feedWatchdog();   // a network call may take a while; reset the timer before it
+
   WiFiClientSecure client;
-  client.setInsecure();   // TEMPORARY: replaced in the hardening phase
+  client.setInsecure();            // TEMPORARY: replaced in the hardening phase
+  client.setHandshakeTimeout(10);  // give up on the secure connection after 10 s
 
   HTTPClient http;
-  http.setTimeout(5000);
+  http.setConnectTimeout(5000);    // give up on the basic connection after 5 s
+  http.setTimeout(5000);           // give up waiting for a reply after 5 s
   http.begin(client, String(SUPABASE_URL) + "/rest/v1/rpc/" + fn);
   http.addHeader("Content-Type", "application/json");
   http.addHeader("apikey", SUPABASE_KEY);
@@ -114,9 +148,13 @@ int callRpc(const char* fn, const String& body, String& response) {
     http.addHeader("Authorization", String("Bearer ") + SUPABASE_KEY);
   }
 
+  unsigned long t0 = millis();
   int code = http.POST(body);
   response = http.getString();
   http.end();
+  Serial.printf("  %s: HTTP %d in %lu ms\n", fn, code, millis() - t0);
+
+  feedWatchdog();
   return code;
 }
 
@@ -137,6 +175,9 @@ void syncWithCloud() {
     Serial.println("Sync: couldn't read response");
     return;
   }
+
+  Serial.printf("Sync OK, %d command(s) waiting, free memory %u bytes\n",
+                doc["commands"].as<JsonArray>().size(), ESP.getFreeHeap());
 
   // Settings
   for (JsonObject z : doc["zones"].as<JsonArray>()) {
@@ -178,7 +219,7 @@ void flushLogs() {
     String response;
     int code = callRpc("device_log_spray", body, response);
     if (code < 200 || code >= 300) {
-      Serial.printf("Log failed: HTTP %d, will retry\n", code);
+      Serial.printf("Log failed: HTTP %d, will retry next check-in\n", code);
       return;
     }
     for (int k = 1; k < logCount; k++) logQueue[k - 1] = logQueue[k];
@@ -198,6 +239,7 @@ void setup() {
   delay(1000);
   Serial.println("Spraynodal node starting...");
 
+  startWatchdog();
   loadSettings();
 
   WiFi.mode(WIFI_STA);
@@ -206,6 +248,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED && millis() - start < 15000) {
     delay(500);
     Serial.print(".");
+    feedWatchdog();
   }
   Serial.println();
   if (WiFi.status() == WL_CONNECTED) {
@@ -217,6 +260,7 @@ void setup() {
 }
 
 void loop() {
+  feedWatchdog();
   unsigned long now = millis();
 
   // 1. A pump is running: only decide when to stop it. No network calls while spraying.
@@ -248,6 +292,8 @@ void loop() {
     firstSync = false;
     lastSync = now;
     syncWithCloud();
-    flushLogs();
+
+    // If a spray just arrived, do it first. Logs go out at the next check-in.
+    if (!anySprayWaiting()) flushLogs();
   }
 }
