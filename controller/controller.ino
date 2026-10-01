@@ -9,31 +9,48 @@
 // ================= Hardware =================
 const int RELAY_ON  = HIGH;   // swap HIGH/LOW if your relay module is active-LOW
 const int RELAY_OFF = LOW;
-const unsigned long MAX_MIST_MS = 8000;   // hard safety ceiling
+
+// Absolute, hardcoded last-resort ceiling. No matter what the cloud says (bad
+// data, a bug, a stale response), nothing this firmware controls is ever left
+// on longer than this. Per-hardware-type ceilings below are the *real* limits
+// in normal operation; this is just the backstop if those ever fail to apply.
+const unsigned long ABSOLUTE_MAX_ON_MS = 6UL * 60 * 60 * 1000;   // 6 hours
 
 // Watchdog: if the ESP32 freezes for this long, it restarts itself,
 // and setup() switches every relay OFF. Safety net for a stuck pump.
 const uint32_t WATCHDOG_MS = 30000;
 
 // ================= Zones =================
-// Pin numbers live here on purpose: the cloud never chooses pins.
+// Pin numbers AND hardware type live here on purpose: the cloud never chooses
+// pins, and it never silently changes what's physically wired to one either.
+// If the cloud ever reports a different hardware_type_id for a zone than what's
+// compiled in here, that update is logged and ignored rather than trusted --
+// see the check in syncWithCloud().
+//
+// defaultMaxOnSec is only a fallback used before the first successful cloud
+// sync (or if sync keeps failing). Once synced, maxOnSec comes from the
+// cloud's hardware_types.max_on_sec, which is the authoritative source.
 struct Zone {
   const char* name;
+  const char* hardwareType;
   int pin;
   unsigned long intervalMin;
-  unsigned long burstSec;
+  unsigned long durationSec;
+  unsigned long maxOnSec;          // current effective safety ceiling for this zone
+  unsigned long defaultMaxOnSec;   // fallback until the cloud confirms one
   bool enabled;
   unsigned long lastStart;
   bool manualPending;
 };
 
 Zone zones[] = {
-  { "moss",   25, 240,  5, true, 0, false },
-  { "lichen", 26, 1440, 2, true, 0, false },
+  // name,     hardwareType,  pin, intervalMin, durationSec, maxOnSec(placeholder), defaultMaxOnSec, enabled, lastStart, manualPending
+  { "moss",   "mist-nozzle", 25, 240,  5, 8, 8,  true, 0, false },
+  { "lichen", "mist-nozzle", 26, 1440, 2, 8, 8,  true, 0, false },
 };
 const int NUM_ZONES = sizeof(zones) / sizeof(zones[0]);
 
-int activeZone = -1;            // -1 means nothing is spraying
+int activeZone = -1;            // -1 means nothing is active
 unsigned long activeStart = 0;
 bool activeManual = false;
 
@@ -42,7 +59,7 @@ const unsigned long SYNC_EVERY_MS = 60UL * 1000;   // check in every 60 s
 unsigned long lastSync = 0;
 bool firstSync = true;
 
-// Sprays waiting to be logged (sent only while no pump is running)
+// Activations waiting to be logged (sent only while nothing is currently on)
 struct LogEntry { int zone; int durationSec; bool manual; };
 const int LOG_QUEUE_SIZE = 10;
 LogEntry logQueue[LOG_QUEUE_SIZE];
@@ -60,11 +77,18 @@ int findZone(const char* name) {
   return -1;
 }
 
-bool anySprayWaiting() {
+bool anyActivationWaiting() {
   for (int i = 0; i < NUM_ZONES; i++) {
     if (zones[i].manualPending) return true;
   }
   return false;
+}
+
+// This zone's actual ceiling right now: whatever the cloud most recently
+// confirmed, capped by the absolute hardcoded backstop either way.
+unsigned long effectiveMaxOnMs(int i) {
+  unsigned long ms = zones[i].maxOnSec * 1000UL;
+  return min(ms, ABSOLUTE_MAX_ON_MS);
 }
 
 // ================= Watchdog =================
@@ -90,8 +114,11 @@ void loadSettings() {
   prefs.begin("spraynodal", false);
   for (int i = 0; i < NUM_ZONES; i++) {
     String n = zones[i].name;
-    zones[i].intervalMin = constrain(prefs.getULong((n + "_int").c_str(), zones[i].intervalMin), 1UL, 10080UL);
-    zones[i].burstSec    = constrain(prefs.getULong((n + "_burst").c_str(), zones[i].burstSec), 1UL, 8UL);
+    // Fallback ceiling until the cloud confirms a real one, so a cold boot
+    // with no network yet still has a sane limit rather than an unset one.
+    zones[i].maxOnSec   = prefs.getULong((n + "_maxon").c_str(), zones[i].defaultMaxOnSec);
+    zones[i].intervalMin = constrain(prefs.getULong((n + "_int").c_str(), zones[i].intervalMin), 1UL, 525600UL);
+    zones[i].durationSec = constrain(prefs.getULong((n + "_dur").c_str(), zones[i].durationSec), 1UL, zones[i].maxOnSec);
     zones[i].enabled     = prefs.getBool((n + "_en").c_str(), zones[i].enabled);
   }
   prefs.end();
@@ -101,12 +128,13 @@ void saveZone(int i) {
   String n = zones[i].name;
   prefs.begin("spraynodal", false);
   prefs.putULong((n + "_int").c_str(), zones[i].intervalMin);
-  prefs.putULong((n + "_burst").c_str(), zones[i].burstSec);
+  prefs.putULong((n + "_dur").c_str(), zones[i].durationSec);
+  prefs.putULong((n + "_maxon").c_str(), zones[i].maxOnSec);
   prefs.putBool((n + "_en").c_str(), zones[i].enabled);
   prefs.end();
 }
 
-// ================= Pumps =================
+// ================= Relays =================
 void allRelaysOff() {
   for (int i = 0; i < NUM_ZONES; i++) digitalWrite(zones[i].pin, RELAY_OFF);
 }
@@ -115,16 +143,16 @@ void startZone(int i, bool manual) {
   activeZone = i;
   activeStart = millis();
   activeManual = manual;
-  zones[i].lastStart = activeStart;   // a manual spray also restarts the schedule
+  zones[i].lastStart = activeStart;   // a manual activation also restarts the schedule
   digitalWrite(zones[i].pin, RELAY_ON);
-  Serial.printf("%s pump ON (%s)\n", zones[i].name, manual ? "manual" : "schedule");
+  Serial.printf("%s (%s) ON (%s)\n", zones[i].name, zones[i].hardwareType, manual ? "manual" : "schedule");
 }
 
 void stopActive() {
   allRelaysOff();
-  Serial.printf("%s pump OFF\n", zones[activeZone].name);
+  Serial.printf("%s OFF\n", zones[activeZone].name);
   if (logCount < LOG_QUEUE_SIZE) {
-    logQueue[logCount++] = { activeZone, (int)zones[activeZone].burstSec, activeManual };
+    logQueue[logCount++] = { activeZone, (int)zones[activeZone].durationSec, activeManual };
   }
   activeZone = -1;
 }
@@ -183,28 +211,44 @@ void syncWithCloud() {
   for (JsonObject z : doc["zones"].as<JsonArray>()) {
     int i = findZone(z["name"] | "");
     if (i < 0) continue;   // a zone this node doesn't have
-    if (!z["interval_min"].is<int>() || !z["burst_sec"].is<int>()) continue;   // skip bad data
 
-    unsigned long iv = constrain(z["interval_min"].as<long>(), 1L, 10080L);
-    unsigned long bs = constrain(z["burst_sec"].as<long>(), 1L, 8L);
+    const char* cloudHwType = z["hardware_type_id"] | "";
+    if (strcmp(cloudHwType, zones[i].hardwareType) != 0) {
+      // The cloud thinks this zone is wired as something it isn't. Ignore the
+      // update entirely rather than apply a safety ceiling or timing meant for
+      // different hardware to what's actually on this pin.
+      Serial.printf("REFUSING update for %s: cloud says hardware_type '%s', firmware says '%s'\n",
+                    zones[i].name, cloudHwType, zones[i].hardwareType);
+      continue;
+    }
+
+    if (!z["interval_min"].is<int>() || !z["duration_sec"].is<int>() || !z["max_on_sec"].is<int>()) {
+      continue;   // skip bad/incomplete data
+    }
+
+    unsigned long cloudMaxOn = constrain(z["max_on_sec"].as<long>(), 1L, 86400L);
+    unsigned long iv = constrain(z["interval_min"].as<long>(), 1L, 525600L);
+    unsigned long ds = constrain(z["duration_sec"].as<long>(), 1L, (long)cloudMaxOn);
     bool en = z["enabled"] | true;
 
-    if (iv != zones[i].intervalMin || bs != zones[i].burstSec || en != zones[i].enabled) {
+    if (iv != zones[i].intervalMin || ds != zones[i].durationSec ||
+        cloudMaxOn != zones[i].maxOnSec || en != zones[i].enabled) {
       zones[i].intervalMin = iv;
-      zones[i].burstSec = bs;
+      zones[i].durationSec = ds;
+      zones[i].maxOnSec = cloudMaxOn;
       zones[i].enabled = en;
       saveZone(i);   // only write flash when something actually changed
-      Serial.printf("Updated %s: every %lu min, %lu s, %s\n",
-                    zones[i].name, iv, bs, en ? "enabled" : "disabled");
+      Serial.printf("Updated %s (%s): every %lu min, %lu s (ceiling %lu s), %s\n",
+                    zones[i].name, zones[i].hardwareType, iv, ds, cloudMaxOn, en ? "enabled" : "disabled");
     }
   }
 
-  // "Spray now" commands
+  // "Activate now" commands
   for (JsonObject c : doc["commands"].as<JsonArray>()) {
     int i = findZone(c["zone"] | "");
     if (i >= 0) {
       zones[i].manualPending = true;
-      Serial.printf("Command received: spray %s\n", zones[i].name);
+      Serial.printf("Command received: activate %s\n", zones[i].name);
     }
   }
 }
@@ -263,14 +307,14 @@ void loop() {
   feedWatchdog();
   unsigned long now = millis();
 
-  // 1. A pump is running: only decide when to stop it. No network calls while spraying.
+  // 1. Something is active: only decide when to stop it. No network calls while active.
   if (activeZone >= 0) {
-    unsigned long burstMs = min(zones[activeZone].burstSec * 1000UL, MAX_MIST_MS);
-    if (now - activeStart >= burstMs) stopActive();
+    unsigned long onMs = min(zones[activeZone].durationSec * 1000UL, effectiveMaxOnMs(activeZone));
+    if (now - activeStart >= onMs) stopActive();
     return;
   }
 
-  // 2. Manual "spray now" commands go first
+  // 2. Manual "activate now" commands go first
   for (int i = 0; i < NUM_ZONES; i++) {
     if (zones[i].manualPending) {
       zones[i].manualPending = false;
@@ -279,7 +323,7 @@ void loop() {
     }
   }
 
-  // 3. Scheduled sprays
+  // 3. Scheduled activations
   for (int i = 0; i < NUM_ZONES; i++) {
     if (zones[i].enabled && now - zones[i].lastStart >= minToMs(zones[i].intervalMin)) {
       startZone(i, false);
@@ -293,7 +337,7 @@ void loop() {
     lastSync = now;
     syncWithCloud();
 
-    // If a spray just arrived, do it first. Logs go out at the next check-in.
-    if (!anySprayWaiting()) flushLogs();
+    // If an activation just arrived, do it first. Logs go out at the next check-in.
+    if (!anyActivationWaiting()) flushLogs();
   }
 }

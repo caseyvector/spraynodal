@@ -20,6 +20,7 @@
   .row { display:flex; gap:12px; flex-wrap:wrap; align-items:end; margin-top:8px; }
   label { display:flex; flex-direction:column; font-size:.85rem; gap:4px; color:var(--muted); }
   input { font:inherit; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); width:110px; }
+  select { font:inherit; padding:8px; border:1px solid var(--line); border-radius:8px; background:var(--bg); color:var(--text); width:180px; }
   #login input { width:100%; }
   input[type=checkbox] { width:auto; height:22px; }
   button { font:inherit; padding:8px 14px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
@@ -31,6 +32,7 @@
   .zone { border-top:1px solid var(--line); padding-top:12px; margin-top:12px; }
   .msg { font-size:.9rem; margin-top:8px; min-height:1.2em; }
   .error { color:var(--warn); }
+  .info { color:var(--accent); }
   table { width:100%; border-collapse:collapse; font-size:.9rem; }
   td, th { text-align:left; padding:6px 4px; border-bottom:1px solid var(--line); }
   [hidden] { display:none !important; }
@@ -56,7 +58,7 @@
   <section id="dashboard" hidden>
     <div id="nodes"></div>
     <div class="card">
-      <h2>Recent sprays</h2>
+      <h2>Recent activity</h2>
       <table>
         <thead><tr><th>When</th><th>Zone</th><th>Length</th><th>Type</th></tr></thead>
         <tbody id="log"></tbody>
@@ -99,6 +101,80 @@ function fmtInterval(m) {
   return `${m} min`;
 }
 
+// ---------- Reference data (plant/hardware database) ----------
+// Loaded once per session. These feed the Plant/Environment/Hardware pickers.
+let PLANTS = [];
+let ENVIRONMENTS = [];
+let HARDWARE_TYPES = [];
+let referenceDataLoaded = false;
+
+async function loadReferenceData() {
+  if (referenceDataLoaded) return;
+  const [
+    { data: plants, error: plantsErr },
+    { data: environments, error: envErr },
+    { data: hardwareTypes, error: hwErr },
+  ] = await Promise.all([
+    sb.from('plant_profiles').select('id, common_name, confidence').order('common_name'),
+    sb.from('environment_contexts').select('id, label, interval_multiplier').order('label'),
+    sb.from('hardware_types').select('id, label, category, control_mode, max_on_sec, control_params').order('label'),
+  ]);
+  if (plantsErr) console.error('Failed to load plant_profiles:', plantsErr.message);
+  if (envErr) console.error('Failed to load environment_contexts:', envErr.message);
+  if (hwErr) console.error('Failed to load hardware_types:', hwErr.message);
+  PLANTS = plants || [];
+  ENVIRONMENTS = environments || [];
+  HARDWARE_TYPES = hardwareTypes || [];
+  referenceDataLoaded = true;
+}
+
+function hardwareType(id) {
+  return HARDWARE_TYPES.find(h => h.id === id);
+}
+
+// This plant's guidance for a specific hardware type, if any exists.
+async function getRequirement(plantId, hardwareTypeId) {
+  const { data, error } = await sb
+    .from('plant_hardware_requirements')
+    .select('priority, params')
+    .eq('plant_id', plantId)
+    .eq('hardware_type_id', hardwareTypeId)
+    .maybeSingle();
+  if (error) {
+    console.error('Failed to load plant_hardware_requirements:', error.message);
+    return null;
+  }
+  return data;
+}
+
+// Converts a requirement's params (whose shape varies by hardware type -- see
+// hardware_types.control_params) into this zone model's two generic numbers:
+// "run for duration_sec every interval_min". Returns null for a hardware type
+// that doesn't fit that shape (the setpoint-controlled ones).
+function toTimedSchedule(hardwareTypeId, params) {
+  switch (hardwareTypeId) {
+    case 'mist-nozzle':
+      return { interval_min: params.interval_min, duration_sec: params.burst_sec };
+    case 'soak-reservoir':
+      return { interval_min: params.interval_min, duration_sec: params.soak_duration_sec };
+    case 'drip-emitter':
+      return { interval_min: params.interval_min, duration_sec: params.duration_sec };
+    case 'fan':
+    case 'grow-light':
+      // Modeled as "on for N hours, once every 24h" -- a simple daily duty
+      // cycle rather than spreading it across the day in multiple bursts.
+      return { interval_min: 1440, duration_sec: Math.round((params.hours_per_day || 0) * 3600) };
+    default:
+      return null;   // setpoint-controlled types (heat-mat, humidifier) -- see below
+  }
+}
+
+function setpointSummary(hardwareTypeId, params) {
+  if (hardwareTypeId === 'heat-mat') return `target ${params.target_temp_f}°F`;
+  if (hardwareTypeId === 'humidifier') return `target ${params.target_humidity_pct}% humidity`;
+  return null;
+}
+
 // ---------- Sign in / out ----------
 async function showScreen() {
   const { data: { session } } = await sb.auth.getSession();
@@ -126,9 +202,11 @@ $('logout').addEventListener('click', async () => {
 
 // ---------- Dashboard ----------
 async function loadDashboard() {
+  await loadReferenceData();
+
   const { data: nodes, error } = await sb
     .from('nodes')
-    .select('id, name, last_seen, zones(id, name, interval_min, burst_sec, enabled)')
+    .select('id, name, last_seen, zones(id, name, interval_min, duration_sec, enabled, hardware_type_id, plant_id, environment_context_id)')
     .order('name');
 
   const box = $('nodes');
@@ -155,11 +233,123 @@ async function loadDashboard() {
   loadLog();
 }
 
+function plantOptionLabel(p) {
+  return p.confidence === 'verified' ? p.common_name : `${p.common_name} (unverified)`;
+}
+
 function zoneBlock(z) {
-  const interval = el('input', { type: 'number', min: 1, max: 10080, value: z.interval_min });
-  const burst = el('input', { type: 'number', min: 1, max: 8, value: z.burst_sec });
+  const interval = el('input', { type: 'number', min: 1, value: z.interval_min });
+  const duration = el('input', { type: 'number', min: 1, value: z.duration_sec });
   const enabled = el('input', { type: 'checkbox', checked: z.enabled });
   const msg = el('div', { className: 'msg muted' });
+
+  // Hardware type picker -- which of your 7 kinds of hardware is actually
+  // wired to this zone. The firmware refuses any update where this disagrees
+  // with what's physically wired, so changing this here only takes effect
+  // once the matching physical relay/wiring change is made and reflashed.
+  const hwSelect = el('select', {},
+    ...HARDWARE_TYPES.map(h => el('option', {
+      value: h.id,
+      textContent: h.label,
+      selected: h.id === z.hardware_type_id,
+    }))
+  );
+
+  function updateDurationHint() {
+    const hw = hardwareType(hwSelect.value);
+    duration.max = hw ? hw.max_on_sec : '';
+    duration.title = hw ? `This hardware type's safety ceiling is ${hw.max_on_sec}s` : '';
+  }
+  updateDurationHint();
+  hwSelect.onchange = updateDurationHint;
+
+  // Plant picker
+  const plantSelect = el('select', {},
+    el('option', { value: '', textContent: '— none —' }),
+    ...PLANTS.map(p => el('option', {
+      value: p.id,
+      textContent: plantOptionLabel(p),
+      selected: p.id === z.plant_id,
+    }))
+  );
+
+  // Environment picker
+  const envSelect = el('select', {},
+    el('option', { value: '', textContent: '— none —' }),
+    ...ENVIRONMENTS.map(e => el('option', {
+      value: e.id,
+      textContent: e.label,
+      selected: e.id === z.environment_context_id,
+    }))
+  );
+
+  const apply = el('button', { className: 'secondary', textContent: 'Apply recommended' });
+  apply.onclick = async () => {
+    if (!plantSelect.value) {
+      msg.className = 'msg error';
+      msg.textContent = 'Pick a plant first.';
+      return;
+    }
+    apply.disabled = true;
+    msg.className = 'msg muted';
+    msg.textContent = 'Looking up recommendation…';
+
+    const hwId = hwSelect.value;
+    const hw = hardwareType(hwId);
+    const req = await getRequirement(plantSelect.value, hwId);
+
+    if (!req) {
+      msg.className = 'msg error';
+      msg.textContent = `No guidance for this plant with ${hw.label} yet.`;
+      apply.disabled = false;
+      return;
+    }
+
+    if (req.priority === 'avoid') {
+      msg.className = 'msg error';
+      msg.textContent = `${hw.label} is NOT recommended for this plant (may cause harm, e.g. rot) -- nothing filled in.`;
+      apply.disabled = false;
+      return;
+    }
+
+    if (hw.control_mode === 'setpoint') {
+      const summary = setpointSummary(hwId, req.params);
+      msg.className = 'msg info';
+      msg.textContent = `This plant wants a ${summary} -- but ${hw.label} needs a sensor to hold a target automatically, ` +
+        `which isn't wired up yet. Interval/Duration below just run it as a plain on/off timer if you want one; ` +
+        `they won't track that target by themselves.`;
+      apply.disabled = false;
+      return;
+    }
+
+    const schedule = toTimedSchedule(hwId, req.params);
+    if (!schedule || schedule.duration_sec == null || schedule.interval_min == null) {
+      msg.className = 'msg error';
+      msg.textContent = `Don't know how to translate ${hw.label}'s requirements into a schedule yet.`;
+      apply.disabled = false;
+      return;
+    }
+
+    // The environment multiplier models how fast things dry out -- relevant to
+    // irrigation timing, not to a light/airflow duty cycle.
+    const env = ENVIRONMENTS.find(e => e.id === envSelect.value);
+    const multiplier = (hw.category === 'irrigation') ? (env?.interval_multiplier ?? 1) : 1;
+    const recommendedInterval = Math.round(schedule.interval_min * multiplier);
+    const recommendedDuration = schedule.duration_sec;
+
+    interval.value = Math.max(1, recommendedInterval);
+    duration.value = Math.min(hw.max_on_sec, Math.max(1, recommendedDuration));
+
+    if (recommendedDuration > hw.max_on_sec) {
+      msg.className = 'msg error';
+      msg.textContent = `Recommended ${recommendedDuration}s exceeds ${hw.label}'s safety ceiling (${hw.max_on_sec}s) -- ` +
+        `capped to ${hw.max_on_sec}s instead. Review before saving.`;
+    } else {
+      msg.className = 'msg muted';
+      msg.textContent = `Filled in from the plant database${(hw.category === 'irrigation' && env) ? ` (adjusted for "${env.label}")` : ''}. Review, then hit Save.`;
+    }
+    apply.disabled = false;
+  };
 
   const save = el('button', { textContent: 'Save' });
   save.onclick = async () => {
@@ -168,36 +358,45 @@ function zoneBlock(z) {
     msg.textContent = 'Saving…';
     const { error } = await sb.from('zones').update({
       interval_min: Number(interval.value),
-      burst_sec: Number(burst.value),
+      duration_sec: Number(duration.value),
       enabled: enabled.checked,
+      hardware_type_id: hwSelect.value,
+      plant_id: plantSelect.value || null,
+      environment_context_id: envSelect.value || null,
     }).eq('id', z.id);
     save.disabled = false;
     if (error) {
       msg.className = 'msg error';
-      msg.textContent = error.message;   // e.g. the database refusing a 20 s burst
+      msg.textContent = error.message;   // e.g. the database refusing a duration past this hardware type's ceiling
     } else {
-      msg.textContent = 'Saved. The node picks it up within a minute.';
+      msg.textContent = 'Saved. The node picks it up within a minute (hardware type changes only take effect once the matching wiring + firmware update is in place).';
     }
   };
 
-  const spray = el('button', { className: 'secondary', textContent: 'Spray now' });
-  spray.onclick = async () => {
-    spray.disabled = true;
+  const activate = el('button', { className: 'secondary', textContent: 'Activate now' });
+  activate.onclick = async () => {
+    activate.disabled = true;
     const { error } = await sb.from('commands').insert({ zone_id: z.id, command: 'spray' });
     msg.className = error ? 'msg error' : 'msg muted';
-    msg.textContent = error ? error.message : 'Queued. It sprays at the next check-in (within a minute).';
-    setTimeout(() => { spray.disabled = false; }, 5000);   // avoid accidental double-taps
+    msg.textContent = error ? error.message : 'Queued. It runs at the next check-in (within a minute).';
+    setTimeout(() => { activate.disabled = false; }, 5000);   // avoid accidental double-taps
   };
 
   return el('div', { className: 'zone' },
     el('strong', { textContent: z.name }),
-    el('div', { className: 'muted', textContent: `Every ${fmtInterval(z.interval_min)}, ${z.burst_sec} s burst${z.enabled ? '' : ' · disabled'}` }),
+    el('div', { className: 'muted', textContent: `Every ${fmtInterval(z.interval_min)}, ${z.duration_sec} s${z.enabled ? '' : ' · disabled'}` }),
+    el('div', { className: 'row' },
+      el('label', {}, 'Hardware', hwSelect),
+      el('label', {}, 'Plant', plantSelect),
+      el('label', {}, 'Environment', envSelect),
+      apply
+    ),
     el('div', { className: 'row' },
       el('label', {}, 'Interval (min)', interval),
-      el('label', {}, 'Burst (s, 1–8)', burst),
+      el('label', {}, 'Duration (s)', duration),
       el('label', {}, 'Enabled', enabled),
       save,
-      spray
+      activate
     ),
     msg
   );
@@ -217,7 +416,7 @@ async function loadLog() {
     return;
   }
   if (!data.length) {
-    tbody.append(el('tr', {}, el('td', { colSpan: 4, className: 'muted', textContent: 'No sprays logged yet.' })));
+    tbody.append(el('tr', {}, el('td', { colSpan: 4, className: 'muted', textContent: 'No activity logged yet.' })));
   }
   for (const r of data) {
     tbody.append(el('tr', {},
