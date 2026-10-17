@@ -206,7 +206,7 @@ async function loadDashboard() {
 
   const { data: nodes, error } = await sb
     .from('nodes')
-    .select('id, name, last_seen, zones(id, name, interval_min, duration_sec, enabled, hardware_type_id, plant_id, environment_context_id)')
+    .select('id, name, last_seen, zones!zones_node_id_fkey(id, name, interval_min, duration_sec, enabled, hardware_type_id, plant_id, environment_context_id)')
     .order('name');
 
   const box = $('nodes');
