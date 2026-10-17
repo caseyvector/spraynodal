@@ -27,7 +27,8 @@
   .online { background:#22c55e; } .offline { background:#9ca3af; }
   .stats { display:flex; gap:24px; margin:8px 0; }
   .stat b { display:block; font-size:1.6rem; font-weight:600; }
-  img.shot { width:100%; border-radius:8px; margin-top:8px; background:var(--line); }
+  img.shot { width:100%; min-height:120px; max-height:70vh; object-fit:contain; border-radius:8px; margin-top:8px; background:var(--line); display:block; }
+  .shotwrap a { font-size:.85rem; }
   svg.spark { width:100%; height:64px; margin-top:8px; }
   .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.8rem; color:#fff; }
   .badge.healthy { background:var(--ok); } .badge.watch { background:var(--watch); }
@@ -232,7 +233,27 @@ async function disablePush() {
 }
 
 // ---------- Data ----------
-function proposalCard(p) {
+// Shows a stored photo, or says plainly why it cannot.
+async function photoBlock(img, label) {
+  const wrap = el('div', { className: 'shotwrap' });
+  if (!img) { wrap.append(el('div', { className: 'muted', textContent: 'No photo is attached to this.' })); return wrap; }
+  const { data: signed, error } = await sb.storage.from('plant-images').createSignedUrl(img.storage_path, 3600);
+  if (error || !signed?.signedUrl) {
+    wrap.append(el('div', { className: 'error', textContent: `Photo could not be loaded: ${error?.message || 'no link returned'}` }));
+    return wrap;
+  }
+  const pic = el('img', { className: 'shot', src: signed.signedUrl, alt: label, loading: 'lazy' });
+  pic.onerror = () => { pic.replaceWith(el('div', { className: 'error', textContent: 'Photo link was created but the image failed to load.' })); };
+  wrap.append(
+    pic,
+    el('div', { className: 'muted' },
+      `Photo taken ${ago(img.taken_at)}${img.light_on === false ? ' (light off)' : ''} · `,
+      el('a', { href: signed.signedUrl, target: '_blank', rel: 'noopener', textContent: 'open full size' }))
+  );
+  return wrap;
+}
+
+function proposalCard(p, photo) {
   const msg = el('div', { className: 'muted' });
   const approve = el('button', { textContent: 'Approve' });
   const reject = el('button', { className: 'secondary', textContent: 'Reject' });
@@ -259,6 +280,7 @@ function proposalCard(p) {
     el('div', { textContent: p.reason }),
     diff,
     el('div', { className: 'muted', textContent: `Suggested ${ago(p.created_at)}, expires ${new Date(p.expires_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` }),
+    photo,
     el('div', { className: 'row' }, approve, reject),
     msg
   );
@@ -298,14 +320,7 @@ async function camCard(node) {
   if (images.error) {
     card.append(el('div', { className: 'error', textContent: images.error.message }));
   } else if (images.data.length) {
-    const img = images.data[0];
-    const { data: signed } = await sb.storage.from('plant-images').createSignedUrl(img.storage_path, 3600);
-    if (signed?.signedUrl) {
-      card.append(
-        el('img', { className: 'shot', src: signed.signedUrl, alt: `Latest photo from ${node.name}` }),
-        el('div', { className: 'muted', textContent: `Photo taken ${ago(img.taken_at)}${img.light_on === false ? ' (light off)' : ''}` })
-      );
-    }
+    card.append(await photoBlock(images.data[0], `Latest photo from ${node.name}`));
   } else {
     card.append(el('div', { className: 'muted', textContent: 'No photos yet.' }));
   }
@@ -316,18 +331,18 @@ async function load() {
   const [nodes, props, obs] = await Promise.all([
     sb.from('nodes').select('id, name, last_seen').eq('kind', 'camera').order('name'),
     sb.from('setting_proposals')
-      .select('id, reason, created_at, expires_at, current_settings, proposed_settings, zones(name)')
+      .select('id, reason, created_at, expires_at, current_settings, proposed_settings, zones(name), plant_observations(plant_images(storage_path, taken_at, light_on))')
       .eq('state', 'pending').gt('expires_at', new Date().toISOString())
       .order('created_at', { ascending: false }),
     sb.from('plant_observations')
-      .select('observed_at, status, confidence, summary, zones(name)')
+      .select('observed_at, status, confidence, summary, zones(name), plant_images(storage_path, taken_at, light_on)')
       .order('observed_at', { ascending: false }).limit(10),
   ]);
 
   const pbox = $('proposals');
   pbox.replaceChildren();
   if (props.error) pbox.append(el('div', { className: 'card error', textContent: props.error.message }));
-  else for (const p of props.data) pbox.append(proposalCard(p));
+  else for (const p of props.data) pbox.append(proposalCard(p, await photoBlock(p.plant_observations?.plant_images, 'Photo the suggestion is based on')));
 
   const cbox = $('cams');
   cbox.replaceChildren();
@@ -344,7 +359,8 @@ async function load() {
       el('div', {}, el('strong', { textContent: o.zones?.name ?? 'zone' }), ' ',
         el('span', { className: 'badge ' + o.status, textContent: o.status })),
       el('div', { textContent: o.summary }),
-      el('div', { className: 'muted', textContent: `${ago(o.observed_at)} · confidence ${o.confidence}` })
+      el('div', { className: 'muted', textContent: `${ago(o.observed_at)} · confidence ${o.confidence}` }),
+      o.plant_images ? await photoBlock(o.plant_images, 'Photo for this observation') : ''
     ));
   }
 }
