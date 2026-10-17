@@ -1,0 +1,363 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Spraynodal monitor</title>
+<style>
+  :root { --bg:#f4f7f2; --card:#fff; --text:#1f2a1f; --muted:#6b776b; --accent:#2f7d4f; --line:#dde5dc; --warn:#b54708; --ok:#2f7d4f; --watch:#b7791f; --bad:#b42318; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#121712; --card:#1b221b; --text:#e6ede6; --muted:#9aa89a; --accent:#5fbf85; --line:#2a342a; --warn:#f59e0b; --ok:#5fbf85; --watch:#f59e0b; --bad:#f97066; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:system-ui, sans-serif; background:var(--bg); color:var(--text); }
+  main { max-width:640px; margin:0 auto; padding:16px; }
+  header { display:flex; justify-content:space-between; align-items:center; margin-bottom:16px; }
+  h1 { font-size:1.4rem; margin:0; }
+  h2 { font-size:1.1rem; margin:0 0 4px; }
+  a { color:var(--accent); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-bottom:16px; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  .error { color:var(--warn); }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; margin-top:10px; }
+  button { font:inherit; padding:8px 14px; border:0; border-radius:8px; background:var(--accent); color:#fff; cursor:pointer; }
+  button.secondary { background:transparent; color:var(--accent); border:1px solid var(--accent); }
+  button:disabled { opacity:.5; cursor:default; }
+  .dot { display:inline-block; width:10px; height:10px; border-radius:50%; margin-right:8px; }
+  .online { background:#22c55e; } .offline { background:#9ca3af; }
+  .stats { display:flex; gap:24px; margin:8px 0; }
+  .stat b { display:block; font-size:1.6rem; font-weight:600; }
+  img.shot { width:100%; border-radius:8px; margin-top:8px; background:var(--line); }
+  svg.spark { width:100%; height:64px; margin-top:8px; }
+  .badge { display:inline-block; padding:2px 8px; border-radius:999px; font-size:.8rem; color:#fff; }
+  .badge.healthy { background:var(--ok); } .badge.watch { background:var(--watch); }
+  .badge.stressed, .badge.critical { background:var(--bad); } .badge.unknown { background:var(--muted); }
+  .obs { border-top:1px solid var(--line); padding:10px 0; }
+  .obs:first-child { border-top:0; }
+  ul.diff { margin:6px 0; padding-left:18px; }
+  [hidden] { display:none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>🌿 Plant monitor</h1>
+    <a href="index.html">Controls</a>
+  </header>
+
+  <section id="gate" class="card" hidden>
+    <h2>Sign in first</h2>
+    <p class="muted">Sign in on the Controls page, then come back here.</p>
+    <a href="index.html">Go to Controls</a>
+  </section>
+
+  <section id="content" hidden>
+    <div class="card" id="push-card">
+      <h2>Notifications</h2>
+      <div class="muted" id="push-status">Checking…</div>
+      <div class="row"><button id="push-btn" hidden></button></div>
+    </div>
+    <div id="proposals"></div>
+    <div id="cams"></div>
+    <div class="card">
+      <h2>Recent observations</h2>
+      <div id="obs"></div>
+    </div>
+  </section>
+</main>
+
+<script type="module">
+import { createClient } from 'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/+esm';
+
+// Public by design. Row-level security protects the data. Never put a secret key here.
+const SUPABASE_URL = 'https://lfuhyqoqpaypnfhfewwq.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_w4zY4EA2-bgKUYej-fHyPQ_OcEejpiK';
+// The PUBLIC half of the key pair from "npx web-push generate-vapid-keys". Safe to put here.
+const VAPID_PUBLIC_KEY = '04d6b21ded5c3660f414c1b788e9744601d2e557996cfee9cf63e23536891d1d';
+
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY);
+const $ = (id) => document.getElementById(id);
+
+function el(tag, props = {}, ...children) {
+  const e = document.createElement(tag);
+  Object.assign(e, props);
+  for (const c of children) e.append(c);
+  return e;
+}
+
+function ago(ts) {
+  if (!ts) return 'never';
+  const s = Math.round((Date.now() - new Date(ts)) / 1000);
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  return `${Math.round(s / 86400)} d ago`;
+}
+
+function fmtInterval(m) {
+  if (m % 1440 === 0) return `${m / 1440} day${m === 1440 ? '' : 's'}`;
+  if (m % 60 === 0) return `${m / 60} h`;
+  return `${m} min`;
+}
+
+function fmtSetting(key, val) {
+  if (key === 'interval_min') return `every ${fmtInterval(Number(val))}`;
+  if (key === 'duration_sec') return `${val} s per run`;
+  if (key === 'enabled') return val ? 'on' : 'off';
+  return String(val);
+}
+
+function labelFor(key) {
+  return { interval_min: 'Interval', duration_sec: 'Duration', enabled: 'Enabled' }[key] || key;
+}
+
+// ---------- Charts ----------
+function sparkline(points, key) {
+  const vals = points.map((p) => Number(p[key])).filter((v) => Number.isFinite(v));
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 300 64');
+  svg.setAttribute('class', 'spark');
+  svg.setAttribute('role', 'img');
+  svg.setAttribute('aria-label', `${key} over the last 24 hours`);
+  if (vals.length < 2) return svg;
+  const min = Math.min(...vals), max = Math.max(...vals);
+  const span = max - min || 1;
+  const pts = vals.map((v, i) => {
+    const x = (i / (vals.length - 1)) * 300;
+    const y = 58 - ((v - min) / span) * 52;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  const line = document.createElementNS(NS, 'polyline');
+  line.setAttribute('points', pts);
+  line.setAttribute('fill', 'none');
+  line.setAttribute('style', 'stroke:var(--accent);stroke-width:2;stroke-linejoin:round');
+  svg.append(line);
+  return svg;
+}
+
+// ---------- Push notifications ----------
+function urlBase64ToUint8Array(b64) {
+  const pad = '='.repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, '+').replace(/_/g, '/'));
+  return Uint8Array.from(raw, (c) => c.charCodeAt(0));
+}
+
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
+const isStandalone = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+
+async function currentSubscription() {
+  if (!('serviceWorker' in navigator)) return null;
+  const reg = await navigator.serviceWorker.getRegistration();
+  return reg ? reg.pushManager.getSubscription() : null;
+}
+
+async function refreshPushCard() {
+  const status = $('push-status'), btn = $('push-btn');
+  btn.hidden = true;
+  btn.disabled = false;
+
+  if (!('serviceWorker' in navigator) || !('PushManager' in window) || !('Notification' in window)) {
+    status.textContent = isIOS && !isStandalone
+      ? 'On iPhone, add this page to your Home Screen first (Share, then Add to Home Screen), then open it from there.'
+      : 'This browser does not support push notifications.';
+    return;
+  }
+  if (Notification.permission === 'denied') {
+    status.textContent = 'Notifications are blocked for this site. Allow them in your browser settings, then reload.';
+    return;
+  }
+  const sub = await currentSubscription();
+  if (sub && Notification.permission === 'granted') {
+    status.textContent = 'On for this device. You will be notified when a plant needs a settings change.';
+    btn.textContent = 'Turn off';
+    btn.className = 'secondary';
+    btn.onclick = disablePush;
+  } else {
+    status.textContent = 'Off for this device.';
+    btn.textContent = 'Turn on notifications';
+    btn.className = '';
+    btn.onclick = enablePush;
+  }
+  btn.hidden = false;
+}
+
+async function enablePush() {
+  const status = $('push-status'), btn = $('push-btn');
+  if (VAPID_PUBLIC_KEY.startsWith('PASTE_')) {
+    status.textContent = 'Setup needed: put the VAPID public key into VAPID_PUBLIC_KEY in monitor.html.';
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { status.textContent = 'Permission was not granted.'; btn.disabled = false; return; }
+
+    await navigator.serviceWorker.register('sw.js');
+    const reg = await navigator.serviceWorker.ready;
+    const sub = (await reg.pushManager.getSubscription()) ||
+      (await reg.pushManager.subscribe({
+        userVisibleOnly: true,
+        applicationServerKey: urlBase64ToUint8Array(VAPID_PUBLIC_KEY),
+      }));
+    const j = sub.toJSON();
+    const { error } = await sb.from('push_subscriptions').upsert({
+      endpoint: j.endpoint,
+      p256dh: j.keys.p256dh,
+      auth: j.keys.auth,
+      user_agent: navigator.userAgent.slice(0, 200),
+    }, { onConflict: 'endpoint' });
+    if (error) throw error;
+  } catch (e) {
+    status.textContent = `Could not turn on notifications: ${e.message || e}`;
+    btn.disabled = false;
+    return;
+  }
+  refreshPushCard();
+}
+
+async function disablePush() {
+  const btn = $('push-btn');
+  btn.disabled = true;
+  try {
+    const sub = await currentSubscription();
+    if (sub) {
+      await sb.from('push_subscriptions').delete().eq('endpoint', sub.endpoint);
+      await sub.unsubscribe();
+    }
+  } catch (e) {
+    $('push-status').textContent = `Could not turn off: ${e.message || e}`;
+  }
+  refreshPushCard();
+}
+
+// ---------- Data ----------
+function proposalCard(p) {
+  const msg = el('div', { className: 'muted' });
+  const approve = el('button', { textContent: 'Approve' });
+  const reject = el('button', { className: 'secondary', textContent: 'Reject' });
+
+  async function decide(ok) {
+    approve.disabled = reject.disabled = true;
+    msg.className = 'muted';
+    msg.textContent = 'Saving…';
+    const { error } = await sb.rpc('apply_setting_proposal', { p_proposal_id: p.id, p_approve: ok });
+    if (error) { msg.className = 'error'; msg.textContent = error.message; approve.disabled = reject.disabled = false; return; }
+    load();
+  }
+  approve.onclick = () => decide(true);
+  reject.onclick = () => decide(false);
+
+  const diff = el('ul', { className: 'diff' });
+  for (const [k, v] of Object.entries(p.proposed_settings || {})) {
+    const before = p.current_settings ? p.current_settings[k] : undefined;
+    diff.append(el('li', { textContent: `${labelFor(k)}: ${before === undefined ? '?' : fmtSetting(k, before)} → ${fmtSetting(k, v)}` }));
+  }
+
+  return el('div', { className: 'card' },
+    el('h2', { textContent: `Suggested change: ${p.zones?.name ?? 'zone'}` }),
+    el('div', { textContent: p.reason }),
+    diff,
+    el('div', { className: 'muted', textContent: `Suggested ${ago(p.created_at)}, expires ${new Date(p.expires_at).toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })}` }),
+    el('div', { className: 'row' }, approve, reject),
+    msg
+  );
+}
+
+async function camCard(node) {
+  const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString();
+  const [readings, images] = await Promise.all([
+    sb.from('sensor_readings').select('taken_at, temp_c, humidity_pct')
+      .eq('node_id', node.id).gte('taken_at', since).order('taken_at').limit(2000),
+    sb.from('plant_images').select('taken_at, storage_path, light_on')
+      .eq('node_id', node.id).order('taken_at', { ascending: false }).limit(1),
+  ]);
+
+  const online = node.last_seen && (Date.now() - new Date(node.last_seen)) < 30 * 60 * 1000;
+  const card = el('div', { className: 'card' },
+    el('h2', {}, el('span', { className: 'dot ' + (online ? 'online' : 'offline') }), node.name),
+    el('div', { className: 'muted', textContent: `${online ? 'Online' : 'Offline'} · last check-in ${ago(node.last_seen)}` })
+  );
+
+  if (readings.error) {
+    card.append(el('div', { className: 'error', textContent: readings.error.message }));
+  } else if (!readings.data.length) {
+    card.append(el('div', { className: 'muted', textContent: 'No sensor readings in the last 24 hours.' }));
+  } else {
+    const last = readings.data[readings.data.length - 1];
+    card.append(
+      el('div', { className: 'stats' },
+        el('div', { className: 'stat' }, el('b', { textContent: last.humidity_pct == null ? '–' : `${Math.round(last.humidity_pct)}%` }), el('span', { className: 'muted', textContent: 'humidity' })),
+        el('div', { className: 'stat' }, el('b', { textContent: last.temp_c == null ? '–' : `${Number(last.temp_c).toFixed(1)}°C` }), el('span', { className: 'muted', textContent: 'temperature' }))
+      ),
+      el('div', { className: 'muted', textContent: `Humidity, last 24 h · updated ${ago(last.taken_at)}` }),
+      sparkline(readings.data, 'humidity_pct')
+    );
+  }
+
+  if (images.error) {
+    card.append(el('div', { className: 'error', textContent: images.error.message }));
+  } else if (images.data.length) {
+    const img = images.data[0];
+    const { data: signed } = await sb.storage.from('plant-images').createSignedUrl(img.storage_path, 3600);
+    if (signed?.signedUrl) {
+      card.append(
+        el('img', { className: 'shot', src: signed.signedUrl, alt: `Latest photo from ${node.name}` }),
+        el('div', { className: 'muted', textContent: `Photo taken ${ago(img.taken_at)}${img.light_on === false ? ' (light off)' : ''}` })
+      );
+    }
+  } else {
+    card.append(el('div', { className: 'muted', textContent: 'No photos yet.' }));
+  }
+  return card;
+}
+
+async function load() {
+  const [nodes, props, obs] = await Promise.all([
+    sb.from('nodes').select('id, name, last_seen').eq('kind', 'camera').order('name'),
+    sb.from('setting_proposals')
+      .select('id, reason, created_at, expires_at, current_settings, proposed_settings, zones(name)')
+      .eq('state', 'pending').gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false }),
+    sb.from('plant_observations')
+      .select('observed_at, status, confidence, summary, zones(name)')
+      .order('observed_at', { ascending: false }).limit(10),
+  ]);
+
+  const pbox = $('proposals');
+  pbox.replaceChildren();
+  if (props.error) pbox.append(el('div', { className: 'card error', textContent: props.error.message }));
+  else for (const p of props.data) pbox.append(proposalCard(p));
+
+  const cbox = $('cams');
+  cbox.replaceChildren();
+  if (nodes.error) cbox.append(el('div', { className: 'card error', textContent: nodes.error.message }));
+  else if (!nodes.data.length) cbox.append(el('div', { className: 'card muted', textContent: 'No camera nodes yet.' }));
+  else for (const n of nodes.data) cbox.append(await camCard(n));
+
+  const obox = $('obs');
+  obox.replaceChildren();
+  if (obs.error) obox.append(el('div', { className: 'error', textContent: obs.error.message }));
+  else if (!obs.data.length) obox.append(el('div', { className: 'muted', textContent: 'No observations yet.' }));
+  else for (const o of obs.data) {
+    obox.append(el('div', { className: 'obs' },
+      el('div', {}, el('strong', { textContent: o.zones?.name ?? 'zone' }), ' ',
+        el('span', { className: 'badge ' + o.status, textContent: o.status })),
+      el('div', { textContent: o.summary }),
+      el('div', { className: 'muted', textContent: `${ago(o.observed_at)} · confidence ${o.confidence}` })
+    ));
+  }
+}
+
+// ---------- Start ----------
+const { data: { session } } = await sb.auth.getSession();
+$('gate').hidden = !!session;
+$('content').hidden = !session;
+if (session) {
+  refreshPushCard();
+  load();
+  setInterval(load, 60000);
+}
+</script>
+</body>
+</html>
