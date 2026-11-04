@@ -161,10 +161,23 @@ parts as (
                 (select coalesce(json_agg(x order by x.id), '[]'::json) from public.plant_profiles x where x.confidence = 'verified')::text)
   union all
   select 1030, 'plant_hardware_requirements',
-         format('insert into public.plant_hardware_requirements select * from json_populate_recordset(null::public.plant_hardware_requirements, %L) on conflict do nothing;',
+         format('insert into public.plant_hardware_requirements%s select * from json_populate_recordset(null::public.plant_hardware_requirements, %L) on conflict do nothing;',
+                case when idc.attname is not null then ' overriding system value' else '' end,
                 (select coalesce(json_agg(x order by x.plant_id, x.hardware_type_id), '[]'::json)
                    from public.plant_hardware_requirements x
                   where x.plant_id in (select id from public.plant_profiles where confidence = 'verified'))::text)
+  from (select (select a.attname from pg_attribute a
+                 where a.attrelid = 'public.plant_hardware_requirements'::regclass
+                   and a.attidentity <> '' and not a.attisdropped limit 1) as attname) idc
+  union all
+  -- the id column is auto-numbered: insert the saved ids as they were, then move the counter past them
+  select 1031, 'plant_hardware_requirements_counter',
+         format('select setval(pg_get_serial_sequence(%L, %L), greatest((select coalesce(max(%I), 0) from public.plant_hardware_requirements), 1));',
+                'public.plant_hardware_requirements', idc.attname, idc.attname)
+  from (select (select a.attname from pg_attribute a
+                 where a.attrelid = 'public.plant_hardware_requirements'::regclass
+                   and a.attidentity <> '' and not a.attisdropped limit 1) as attname) idc
+  where idc.attname is not null
 )
 select '-- Exported from the live database on ' || to_char(now() at time zone 'utc', 'YYYY-MM-DD')
        || E' by supabase/sql/export_schema.sql\n\n'

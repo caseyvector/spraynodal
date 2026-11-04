@@ -265,4 +265,5 @@ as $$
 $$;
 
 revoke all on function housekeeping() from public;
--- No grant: only the service role (server-side functions) can run it.
+-- No grant here, but Supabase grants new functions to anon and authenticated automatically;
+-- 04_tighten_function_grants.sql removes that so only the service role can run it.

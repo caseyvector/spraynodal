@@ -7,7 +7,8 @@ editor; there is no migration runner, so nothing here runs automatically.
 |---|---|
 | `../schema.sql` | The original four tables (nodes, zones, commands, spray_log) and their security. Later changes were made in the SQL editor and are recorded below. |
 | `03_camera_agent.sql` | Camera nodes, sensor readings, plant photos, the plant-health agent's observations and setting proposals, push subscriptions, the private photo bucket, and the functions that go with them. Safe to run more than once. |
-| `live_schema_snapshot.sql` | (Not exported yet; run `export_schema.sql` to create it.) The whole current schema printed from the live database: tables, constraints, security policies, functions, triggers, and the reference rows (hardware types, environment contexts, hand-verified plants). Written for reading and for rebuilding a fresh project. |
+| `live_schema_snapshot.sql` | The whole current schema printed from the live database: tables, constraints, security policies, functions, triggers, and the reference rows (hardware types, environment contexts, hand-verified plants). Written for reading and for rebuilding a fresh project. |
+| `04_tighten_function_grants.sql` | Removes the automatic public access Supabase gives new functions, so `housekeeping()` is server-only and the app-only helpers are not callable without signing in. Safe to run more than once. |
 | `export_schema.sql` | Read-only query that produces the snapshot above. Run it in the SQL editor, copy the single result cell, and save it as `live_schema_snapshot.sql`. |
 
 ## Keeping the snapshot current
