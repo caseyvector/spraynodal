@@ -55,7 +55,7 @@ PERENUAL_API_KEY = os.environ.get("PERENUAL_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
-PERENUAL_BASE = "https://perenual.com/api"
+PERENUAL_BASE = "https://perenual.com/api/v2"   # the unversioned /api path returns empty care fields
 REQUEST_DELAY_SEC = 1.0   # be polite; raise this if you see 429s
 
 WATERING_TO_INTERVAL_MIN = {
@@ -70,11 +70,14 @@ SUCCULENT_KEYWORDS = [
     "haworthia", "agave", "euphorbia", "sempervivum",
 ]
 
+# v2 returns phrases like "full sun" or "part sun/part shade"; normalised to lowercase with
+# underscores before lookup. Unknown phrases are skipped, not guessed.
 SUNLIGHT_TO_LIGHT_HOURS_INTENSITY = {
-    "full_shade":      (6, "low"),
-    "part_shade":      (8, "medium"),
-    "sun-part_shade":  (8, "medium"),
-    "full_sun":        (6, "high"),
+    "full_shade":           (6, "low"),
+    "part_shade":           (8, "medium"),
+    "part_sun/part_shade":  (8, "medium"),
+    "sun-part_shade":       (8, "medium"),
+    "full_sun":             (6, "high"),
 }
 
 
@@ -115,8 +118,19 @@ def is_succulent(common_name, family):
     return any(kw in text for kw in SUCCULENT_KEYWORDS)
 
 
+def usable(details):
+    """True only when Perenual gave both a known watering level and a known sunlight value.
+    Anything less is skipped: no invented default schedules."""
+    if not details:
+        return False
+    watering = (details.get("watering") or "").lower()
+    sun = details.get("sunlight") or []
+    sunlight = sun[0].lower().replace(" ", "_") if sun else None
+    return watering in WATERING_TO_INTERVAL_MIN and sunlight in SUNLIGHT_TO_LIGHT_HOURS_INTENSITY
+
+
 def map_species(species, details):
-    """Returns (plant_profile_row, [hardware_requirement_rows])."""
+    """Returns (plant_profile_row, [hardware_requirement_rows]). Call only when usable(details)."""
     plant_id = f"pn-{species['id']}"
     common_name = species.get("common_name") or "Unknown"
     scientific = ", ".join(species.get("scientific_name") or []) or None
@@ -124,11 +138,11 @@ def map_species(species, details):
 
     watering = ((details or {}).get("watering") or species.get("watering") or "").lower()
     sunlight_raw = (details or {}).get("sunlight") or species.get("sunlight") or []
-    sunlight = sunlight_raw[0].lower() if sunlight_raw else None
-    light_hours, light_intensity = SUNLIGHT_TO_LIGHT_HOURS_INTENSITY.get(sunlight, (8, "medium"))
+    sunlight = sunlight_raw[0].lower().replace(" ", "_") if sunlight_raw else None
+    light_hours, light_intensity = SUNLIGHT_TO_LIGHT_HOURS_INTENSITY[sunlight]
 
     succulent = is_succulent(common_name, family)
-    interval_min = WATERING_TO_INTERVAL_MIN.get(watering, 1440)
+    interval_min = WATERING_TO_INTERVAL_MIN[watering]
 
     profile = {
         "id": plant_id,
@@ -146,7 +160,8 @@ def map_species(species, details):
         "confidence": "imported",
         "needs_review": True,
         "notes": f"Imported from Perenual (species id {species['id']}); "
-                 f"raw watering='{watering}', sunlight='{sunlight}', family='{family}'. Not hand-verified.",
+                 f"raw watering='{watering}', sunlight='{sunlight}', family='{family}', "
+                 f"indoor={(details or {}).get('indoor')}, hardiness zones={(details or {}).get('hardiness')}. Not hand-verified.",
     }
 
     requirements = []
@@ -232,6 +247,9 @@ def main():
     parser.add_argument("--start-page", type=int, default=1,
                          help="Resume from this page instead of page 1 -- use the "
                               "'next start page' the previous run prints when it stops")
+    parser.add_argument("--all-species", action="store_true",
+                         help="Include outdoor species too. Default is indoor plants only "
+                              "(about 381 species), since this system is for indoor grows.")
     parser.add_argument("--batch-size", type=int, default=20,
                          help="plants to upsert to Supabase per call")
     parser.add_argument("--daily-request-budget", type=int, default=90,
@@ -249,6 +267,7 @@ def main():
     profile_batch = []
     requirement_batch = []
     total = 0
+    skipped = 0
     page = args.start_page
     last_page_fetched = args.start_page - 1
     stop_reason = None
@@ -260,7 +279,7 @@ def main():
                 break
 
             print(f"Fetching species list page {page}...")
-            data = perenual_get("species-list", {"page": page})
+            data = perenual_get("species-list", {"page": page} if args.all_species else {"page": page, "indoor": 1})
             species_list = data.get("data", [])
             if not species_list:
                 print("No more results, stopping.")
@@ -278,6 +297,9 @@ def main():
                     print(f"  Skipping species {species['id']}: {e}", file=sys.stderr)
                     details = None
 
+                if not usable(details):
+                    skipped += 1
+                    continue
                 profile, requirements = map_species(species, details)
                 profile_batch.append(profile)
                 requirement_batch.extend(requirements)
@@ -309,7 +331,7 @@ def main():
         insert_requirements(requirement_batch)
         print(f"  Upserted final batch, {total} total")
 
-    print(f"Done this run. Imported/updated {total} species using {request_count} requests.")
+    print(f"Done this run. Imported/updated {total} species using {request_count} requests; skipped {skipped} with missing or unrecognised care data.")
 
     if stop_reason in ("budget", "quota"):
         resume_page = last_page_fetched + 1
