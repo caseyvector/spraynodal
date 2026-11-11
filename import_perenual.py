@@ -56,7 +56,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_SERVICE_KEY = os.environ.get("SUPABASE_SERVICE_KEY")
 
 PERENUAL_BASE = "https://perenual.com/api/v2"   # the unversioned /api path returns empty care fields
-REQUEST_DELAY_SEC = 1.0   # be polite; raise this if you see 429s
+REQUEST_DELAY_SEC = 1.0   # be polite; raise this if you see 429s (set with --delay)
 
 WATERING_TO_INTERVAL_MIN = {
     "frequent": 360,
@@ -143,12 +143,14 @@ def map_species(species, details):
 
     succulent = is_succulent(common_name, family)
     interval_min = WATERING_TO_INTERVAL_MIN[watering]
+    indoor = bool((details or {}).get("indoor"))
 
     profile = {
         "id": plant_id,
         "common_name": common_name,
         "scientific_name": scientific,
-        "category": family or "unclassified",
+        # Outdoor species are tagged so the app can hide them from the node plant picker.
+        "category": (family or "unclassified") if indoor else f"outdoor: {family or 'unclassified'}",
         "humidity_min_pct": None,
         "humidity_max_pct": None,
         "temp_min_f": None,
@@ -161,10 +163,15 @@ def map_species(species, details):
         "needs_review": True,
         "notes": f"Imported from Perenual (species id {species['id']}); "
                  f"raw watering='{watering}', sunlight='{sunlight}', family='{family}', "
-                 f"indoor={(details or {}).get('indoor')}, hardiness zones={(details or {}).get('hardiness')}. Not hand-verified.",
+                 f"indoor={(details or {}).get('indoor')}, hardiness zones={(details or {}).get('hardiness')}. Not hand-verified."
+                 + ("" if indoor else " Outdoor/not flagged indoor: reference profile only, no hardware defaults."),
     }
 
     requirements = []
+    if not indoor:
+        # Misting and grow-light defaults make no sense for a tree or a garden plant, so none are invented.
+        return profile, requirements
+
     if succulent or watering == "none":
         requirements.append({
             "plant_id": plant_id, "hardware_type_id": "soak-reservoir",
@@ -250,6 +257,9 @@ def main():
     parser.add_argument("--all-species", action="store_true",
                          help="Include outdoor species too. Default is indoor plants only "
                               "(about 381 species), since this system is for indoor grows.")
+    parser.add_argument("--delay", type=float, default=1.0,
+                         help="Seconds to wait between Perenual requests (default 1.0). "
+                              "Paid plans can use 0.3 or so; raise it if you see rate-limit messages.")
     parser.add_argument("--batch-size", type=int, default=20,
                          help="plants to upsert to Supabase per call")
     parser.add_argument("--daily-request-budget", type=int, default=90,
@@ -257,6 +267,8 @@ def main():
                               "made in this run, leaving headroom under a 100/day free-"
                               "tier quota rather than running until a 429 forces a stop")
     args = parser.parse_args()
+    global REQUEST_DELAY_SEC
+    REQUEST_DELAY_SEC = args.delay
 
     missing = [n for n in ("PERENUAL_API_KEY", "SUPABASE_URL", "SUPABASE_SERVICE_KEY")
                if not os.environ.get(n)]
