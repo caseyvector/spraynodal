@@ -115,7 +115,10 @@ async function loadReferenceData() {
     { data: environments, error: envErr },
     { data: hardwareTypes, error: hwErr },
   ] = await Promise.all([
-    sb.from('plant_profiles').select('id, common_name, confidence').order('common_name'),
+    // Indoor plants only (about 360). The ~8,000 outdoor reference profiles are
+    // searched on demand in the picker, which avoids PostgREST's 1,000-row cutoff.
+    sb.from('plant_profiles').select('id, common_name, confidence, category')
+      .not('category', 'like', 'outdoor:%').order('common_name').limit(2000),
     sb.from('environment_contexts').select('id, label, interval_multiplier').order('label'),
     sb.from('hardware_types').select('id, label, category, control_mode, max_on_sec, control_params').order('label'),
   ]);
@@ -263,15 +266,56 @@ function zoneBlock(z) {
   updateDurationHint();
   hwSelect.onchange = updateDurationHint;
 
-  // Plant picker
-  const plantSelect = el('select', {},
-    el('option', { value: '', textContent: '— none —' }),
-    ...PLANTS.map(p => el('option', {
-      value: p.id,
-      textContent: plantOptionLabel(p),
-      selected: p.id === z.plant_id,
-    }))
-  );
+  // Plant picker: search box + indoor plants; optional on-demand outdoor search.
+  const plantSelect = el('select', {});
+  const plantSearch = el('input', { type: 'search', placeholder: 'Search plants…' });
+  const includeOutdoor = el('input', { type: 'checkbox' });
+  const plantHint = el('div', { className: 'msg muted' });
+  let extraPlants = [];  // outdoor results, plus the zone's current plant if it is outdoor
+  let searchSeq = 0;
+
+  function renderPlantOptions() {
+    const q = plantSearch.value.trim().toLowerCase();
+    const keep = plantSelect.value || z.plant_id;
+    const seen = new Set();
+    const list = [...PLANTS, ...extraPlants].filter(p => {
+      if (seen.has(p.id)) return false;
+      seen.add(p.id);
+      return p.id === keep || !q || p.common_name.toLowerCase().includes(q);
+    });
+    plantSelect.replaceChildren(
+      el('option', { value: '', textContent: '— none —' }),
+      ...list.map(p => el('option', {
+        value: p.id,
+        textContent: plantOptionLabel(p) + (p.category && p.category.startsWith('outdoor:') ? ' [outdoor ref]' : ''),
+        selected: p.id === keep,
+      }))
+    );
+  }
+
+  async function searchOutdoor() {
+    const q = plantSearch.value.trim();
+    const seq = ++searchSeq;
+    if (!includeOutdoor.checked) { extraPlants = extraPlants.filter(p => p.id === z.plant_id); plantHint.textContent = ''; renderPlantOptions(); return; }
+    if (q.length < 3) { plantHint.textContent = 'Type at least 3 letters to search outdoor reference plants.'; return; }
+    const { data, error } = await sb.from('plant_profiles')
+      .select('id, common_name, confidence, category')
+      .ilike('common_name', `%${q}%`).order('common_name').limit(50);
+    if (seq !== searchSeq) return;
+    if (error) { plantHint.textContent = 'Outdoor search failed: ' + error.message; return; }
+    extraPlants = data.filter(p => p.category && p.category.startsWith('outdoor:') || p.id === z.plant_id);
+    plantHint.textContent = `${extraPlants.length} outdoor match(es). Outdoor plants are reference only and have no misting or light defaults.`;
+    renderPlantOptions();
+  }
+
+  plantSearch.oninput = () => { renderPlantOptions(); if (includeOutdoor.checked) searchOutdoor(); };
+  includeOutdoor.onchange = searchOutdoor;
+  renderPlantOptions();
+  // If this zone already uses a plant that isn't in the indoor list, load it so it still shows.
+  if (z.plant_id && !PLANTS.some(p => p.id === z.plant_id)) {
+    sb.from('plant_profiles').select('id, common_name, confidence, category').eq('id', z.plant_id).maybeSingle()
+      .then(({ data }) => { if (data) { extraPlants.push(data); renderPlantOptions(); } });
+  }
 
   // Environment picker
   const envSelect = el('select', {},
@@ -387,7 +431,8 @@ function zoneBlock(z) {
     el('div', { className: 'muted', textContent: `Every ${fmtInterval(z.interval_min)}, ${z.duration_sec} s${z.enabled ? '' : ' · disabled'}` }),
     el('div', { className: 'row' },
       el('label', {}, 'Hardware', hwSelect),
-      el('label', {}, 'Plant', plantSelect),
+      el('label', {}, 'Plant', plantSearch, plantSelect,
+        el('label', {}, includeOutdoor, ' Include outdoor reference plants'), plantHint),
       el('label', {}, 'Environment', envSelect),
       apply
     ),
