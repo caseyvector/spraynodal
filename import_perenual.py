@@ -96,13 +96,23 @@ def perenual_get(path, params=None):
     global request_count
     params = dict(params or {})
     params["key"] = PERENUAL_API_KEY
-    request_count += 1
-    resp = requests.get(f"{PERENUAL_BASE}/{path}", params=params, timeout=15)
+    resp = None
+    for attempt in range(4):
+        request_count += 1
+        try:
+            resp = requests.get(f"{PERENUAL_BASE}/{path}", params=params, timeout=30)
+            break
+        except (requests.Timeout, requests.ConnectionError) as e:
+            wait = 5 * (attempt + 1)
+            print(f"  Network error ({type(e).__name__}), retry {attempt + 1}/3 in {wait}s...", file=sys.stderr)
+            time.sleep(wait)
+    if resp is None:
+        raise requests.ConnectionError(f"Perenual unreachable after 4 tries: {path}")
     if resp.status_code == 429:
         print("  Rate limited -- sleeping 60s and retrying once...", file=sys.stderr)
         time.sleep(60)
         request_count += 1
-        resp = requests.get(f"{PERENUAL_BASE}/{path}", params=params, timeout=15)
+        resp = requests.get(f"{PERENUAL_BASE}/{path}", params=params, timeout=30)
         if resp.status_code == 429:
             raise DailyQuotaExhausted(
                 "Still rate-limited immediately after a 60s wait -- this is the daily "
@@ -366,6 +376,9 @@ def main():
     except DailyQuotaExhausted as e:
         stop_reason = "quota"
         print(f"  {e}", file=sys.stderr)
+    except (requests.RequestException, KeyboardInterrupt) as e:
+        stop_reason = "error"
+        print(f"  Stopping on error: {e}", file=sys.stderr)
 
     if profile_batch:
         upsert_profiles(profile_batch)
@@ -374,8 +387,10 @@ def main():
 
     print(f"Done this run. Imported/updated {total} species using {request_count} requests; skipped {skipped} with missing or unrecognised care data; {already} already in the database (no request spent).")
 
-    if stop_reason in ("budget", "quota"):
-        resume_page = last_page_fetched + 1
+    if stop_reason in ("budget", "quota", "error"):
+        # Already-imported species are skipped on rerun, so resuming at the page
+        # that was in progress costs almost nothing.
+        resume_page = last_page_fetched + 1 if stop_reason != "error" else page
         print(
             f"\nStopped early ({'hit the request budget' if stop_reason == 'budget' else 'Perenual rate-limited us'}) "
             f"before finishing all pages.\nResume tomorrow (or once your quota resets) with:\n"
