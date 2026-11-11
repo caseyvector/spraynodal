@@ -246,6 +246,27 @@ def insert_requirements(rows):
     resp.raise_for_status()
 
 
+def existing_species_ids():
+    """Ids of species already imported (pn-<id>), so reruns don't spend requests on them."""
+    ids = set()
+    offset = 0
+    while True:
+        resp = requests.get(
+            f"{SUPABASE_URL}/rest/v1/plant_profiles",
+            headers={"apikey": SUPABASE_SERVICE_KEY,
+                     "Authorization": f"Bearer {SUPABASE_SERVICE_KEY}"},
+            params={"select": "id", "id": "like.pn-*", "limit": 1000, "offset": offset},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        rows = resp.json()
+        for r in rows:
+            ids.add(r["id"])
+        if len(rows) < 1000:
+            return ids
+        offset += 1000
+
+
 def main():
     global request_count
     parser = argparse.ArgumentParser()
@@ -260,6 +281,8 @@ def main():
     parser.add_argument("--delay", type=float, default=1.0,
                          help="Seconds to wait between Perenual requests (default 1.0). "
                               "Paid plans can use 0.3 or so; raise it if you see rate-limit messages.")
+    parser.add_argument("--refresh", action="store_true",
+                         help="Re-fetch species already in the database (default: skip them)")
     parser.add_argument("--batch-size", type=int, default=20,
                          help="plants to upsert to Supabase per call")
     parser.add_argument("--daily-request-budget", type=int, default=90,
@@ -276,6 +299,9 @@ def main():
         print(f"Missing required env vars: {', '.join(missing)}", file=sys.stderr)
         sys.exit(1)
 
+    have = set() if args.refresh else existing_species_ids()
+    print(f"{len(have)} species already in the database; they will be skipped (use --refresh to re-fetch).")
+    already = 0
     profile_batch = []
     requirement_batch = []
     total = 0
@@ -302,6 +328,9 @@ def main():
                 if request_count >= args.daily_request_budget:
                     stop_reason = "budget"
                     break
+                if f"pn-{species['id']}" in have:
+                    already += 1
+                    continue
                 time.sleep(REQUEST_DELAY_SEC)
                 try:
                     details = perenual_get(f"species/details/{species['id']}")
@@ -343,7 +372,7 @@ def main():
         insert_requirements(requirement_batch)
         print(f"  Upserted final batch, {total} total")
 
-    print(f"Done this run. Imported/updated {total} species using {request_count} requests; skipped {skipped} with missing or unrecognised care data.")
+    print(f"Done this run. Imported/updated {total} species using {request_count} requests; skipped {skipped} with missing or unrecognised care data; {already} already in the database (no request spent).")
 
     if stop_reason in ("budget", "quota"):
         resume_page = last_page_fetched + 1
