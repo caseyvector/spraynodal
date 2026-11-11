@@ -5,6 +5,8 @@
 #include <Preferences.h>
 #include <esp_task_wdt.h>
 #include "secrets.h"
+#include <time.h>
+#include <esp_system.h>
 
 // ================= Hardware =================
 const int RELAY_ON  = HIGH;   // swap HIGH/LOW if your relay module is active-LOW
@@ -69,6 +71,42 @@ Preferences prefs;
 
 // ================= Helpers =================
 unsigned long minToMs(unsigned long m) { return m * 60UL * 1000UL; }
+
+// ---- Persisted last-run times (survive reboots) ----
+// Each time a zone starts, the real clock time (from NTP) is saved to flash.
+// After a reboot, once the clock is set again, each zone's countdown resumes
+// from that saved time instead of starting over from boot.
+Preferences runPrefs;            // separate namespace from zone settings
+bool lastRunsRestored = false;
+
+uint32_t epochNow() {
+  time_t t = time(nullptr);
+  return (t > 1700000000) ? (uint32_t)t : 0;   // 0 = clock not set yet
+}
+
+void saveLastRun(int i) {
+  uint32_t e = epochNow();
+  if (!e) return;                // no real time yet; nothing meaningful to save
+  runPrefs.begin("lastrun", false);
+  runPrefs.putULong(zones[i].name, e);
+  runPrefs.end();
+}
+
+void restoreLastRuns() {
+  uint32_t e = epochNow();
+  runPrefs.begin("lastrun", true);
+  for (int i = 0; i < NUM_ZONES; i++) {
+    uint32_t saved = runPrefs.getULong(zones[i].name, 0);
+    if (!saved || saved > e) continue;
+    uint32_t elapsedSec = e - saved;
+    uint32_t capSec = zones[i].intervalMin * 60UL;
+    if (capSec > 4000000UL) capSec = 4000000UL;   // keep the ms math in range
+    if (elapsedSec > capSec) elapsedSec = capSec;
+    zones[i].lastStart = millis() - elapsedSec * 1000UL;
+    Serial.printf("Restored %s: last ran %lu s ago\n", zones[i].name, (unsigned long)(e - saved));
+  }
+  runPrefs.end();
+}
 
 int findZone(const char* name) {
   for (int i = 0; i < NUM_ZONES; i++) {
@@ -144,6 +182,7 @@ void startZone(int i, bool manual) {
   activeStart = millis();
   activeManual = manual;
   zones[i].lastStart = activeStart;   // a manual activation also restarts the schedule
+  saveLastRun(i);                     // remember it across reboots
   digitalWrite(zones[i].pin, RELAY_ON);
   Serial.printf("%s (%s) ON (%s)\n", zones[i].name, zones[i].hardwareType, manual ? "manual" : "schedule");
 }
@@ -280,6 +319,7 @@ void setup() {
   }
 
   Serial.begin(115200);
+  Serial.printf("Reset reason: %d\n", (int)esp_reset_reason());
   delay(1000);
   Serial.println("Spraynodal node starting...");
 
@@ -301,11 +341,21 @@ void setup() {
   } else {
     Serial.println("Wi-Fi failed, running on saved settings");
   }
+
+  // Start network time only after Wi-Fi is up (calling it earlier can crash on core 3.x).
+  // If Wi-Fi failed, it keeps trying in the background and syncs once Wi-Fi connects.
+  configTime(0, 0, "pool.ntp.org", "time.nist.gov");
 }
 
 void loop() {
   feedWatchdog();
   unsigned long now = millis();
+
+  // 0. Once the clock is set after boot, resume each zone's countdown from its saved last run.
+  if (!lastRunsRestored && epochNow()) {
+    restoreLastRuns();
+    lastRunsRestored = true;
+  }
 
   // 1. Something is active: only decide when to stop it. No network calls while active.
   if (activeZone >= 0) {
