@@ -363,6 +363,7 @@ void loop() {
   if (!lastRunsRestored && epochNow()) {
     restoreLastRuns();
     lastRunsRestored = true;
+    now = millis();   // restore just set lastStart to a newer time; a stale 'now' would look overdue
   }
 
   // 1. Something is active: only decide when to stop it. No network calls while active.
