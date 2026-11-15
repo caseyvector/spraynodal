@@ -394,6 +394,15 @@ void loop() {
     firstSync = false;
     lastSync = now;
     syncWithCloud();
+    // Diagnostic: show each zone's real interval and time left, so a zone that
+    // never fires can be explained from the serial output.
+    for (int i = 0; i < NUM_ZONES; i++) {
+      unsigned long elapsedMs = now - zones[i].lastStart;
+      unsigned long needMs = minToMs(zones[i].intervalMin);
+      long leftSec = (elapsedMs >= needMs) ? 0 : (long)((needMs - elapsedMs) / 1000UL);
+      Serial.printf("  zone %s: %s, every %lu min, next in %ld s, uptime %lu s\n",
+                    zones[i].name, zones[i].enabled ? "on" : "OFF", zones[i].intervalMin, leftSec, now / 1000UL);
+    }
 
     // If an activation just arrived, do it first. Logs go out at the next check-in.
     if (!anyActivationWaiting()) flushLogs();
