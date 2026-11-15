@@ -344,7 +344,11 @@ function zoneBlock(z) {
 
     if (!req) {
       msg.className = 'msg error';
-      msg.textContent = `No guidance for this plant with ${hw.label} yet.`;
+      const sel = plantSelect.selectedOptions[0];
+      const isOutdoor = sel && sel.textContent.includes('[outdoor ref]');
+      msg.textContent = isOutdoor
+        ? 'This is an outdoor reference plant, so it has no misting or light defaults. Pick an indoor plant, or set the interval and duration by hand.'
+        : `No defaults for this plant with ${hw.label}. Set the interval and duration by hand.`;
       apply.disabled = false;
       return;
     }
