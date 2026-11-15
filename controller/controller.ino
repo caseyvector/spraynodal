@@ -94,10 +94,18 @@ void saveLastRun(int i) {
 
 void restoreLastRuns() {
   uint32_t e = epochNow();
-  runPrefs.begin("lastrun", true);
+  runPrefs.begin("lastrun", false);
   for (int i = 0; i < NUM_ZONES; i++) {
     uint32_t saved = runPrefs.getULong(zones[i].name, 0);
-    if (!saved || saved > e) continue;
+    if (!saved || saved > e) {
+      // No usable saved time (a zone that has not sprayed since this feature was
+      // flashed, e.g. a 24 h zone). Start its countdown from now AND save it, so a
+      // reboot before the next spray cannot restart a long wait from zero again.
+      runPrefs.putULong(zones[i].name, e);
+      zones[i].lastStart = millis();
+      Serial.printf("Seeded %s: countdown starts now (no saved last run)\n", zones[i].name);
+      continue;
+    }
     uint32_t elapsedSec = e - saved;
     uint32_t capSec = zones[i].intervalMin * 60UL;
     if (capSec > 4000000UL) capSec = 4000000UL;   // keep the ms math in range
